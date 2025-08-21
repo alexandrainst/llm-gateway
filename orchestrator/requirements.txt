@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+redis>=4.5.0
+httpx
+docker>=6.0.0
+python-dotenv
+structlog
+huggingface-hub>=0.20.0
+prometheus-client>=0.19.0

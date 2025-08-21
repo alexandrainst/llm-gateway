@@ -1,0 +1,44 @@
+services:
+  redis:
+    image: redis:8.2
+    volumes:
+      - redis-data:/data
+
+  orchestrator:
+    build: ./orchestrator
+    container_name: orchestrator
+    env_file:
+      - .env
+    environment:
+      # API authentication
+      API_KEY: ${API_KEY:-changeme}
+      # HuggingFace token for downloading gated models
+      HF_TOKEN: ${HF_TOKEN}
+      # REQUIRED: set this to your host huggingface cache absolute path when launching docker compose
+      HOST_HF_CACHE: ${HOST_HF_CACHE:-/home/alex-admin/.cache/huggingface}
+      # Runtime image to launch (override as needed)
+      RUNTIME_IMAGE: ${RUNTIME_IMAGE:-lmsysorg/sglang:b200-cu129}
+      # Extra args appended to sglang.launch_server (edit if you want)
+      RUNTIME_ARGS: ${RUNTIME_ARGS:---tp 2 --cuda-graph-max-bs 16}
+      RUNTIME_PORT: ${RUNTIME_PORT:-30000}
+      REALTIME_MODEL: ${REALTIME_MODEL:-synquid/gemma-3-27b-it-FP8}
+      MIN_HOT_TTL_S: ${MIN_HOT_TTL_S:-600}
+      L_MAX_S: ${L_MAX_S:-600}
+      P_MAX: ${P_MAX:-0.3}
+      TOKENS_B: ${TOKENS_B:-2}
+      TOKENS_REFILL_PER_SEC: ${TOKENS_REFILL_PER_SEC:-0.000555}
+    ports:
+      - "8000:8000"  # Adjust port as needed for your orchestrator
+    # bind the docker socket so orchestrator can start/stop runtime containers
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOST_HF_CACHE:-/home/alex-admin/.cache/huggingface}:/host_hf_cache:rw
+      - ./orchestrator/app.py:/app/app.py:ro  # Mount app.py for hot reload
+    depends_on:
+      - redis
+    restart: unless-stopped
+    # Add --reload flag for auto-reload on code changes
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info", "--reload"]
+
+volumes:
+  redis-data:
