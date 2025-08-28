@@ -1,0 +1,278 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM Gateway Dashboard</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #0b0f14; color: #e7eef5; }
+    h1 { margin: 0 0 12px 0; font-size: 20px; }
+    .row { display: flex; flex-wrap: wrap; gap: 12px; }
+    .card { background: #121822; border: 1px solid #1e2733; border-radius: 8px; padding: 12px; flex: 1 1 320px; }
+    .kvs { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: center; }
+    .k { color: #9fb0c3; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 6px 8px; border-bottom: 1px solid #1e2733; font-size: 13px; }
+    th { text-align: left; color: #9fb0c3; }
+    .ok { color: #2ecc71; }
+    .bad { color: #e74c3c; }
+    input[type=text] { width: 320px; padding: 6px 8px; border: 1px solid #1e2733; border-radius: 6px; background: #0b0f14; color: #e7eef5; }
+    button { padding: 6px 10px; background: #1e2733; color: #e7eef5; border: 1px solid #293445; border-radius: 6px; cursor: pointer; }
+    button:hover { background: #263041; }
+    .footer { margin-top: 16px; color: #73859a; font-size: 12px; }
+    .scroll-x { overflow-x: auto; }
+    .nowrap { white-space: nowrap; }
+    .muted { color: #9fb0c3; font-size: 12px; }
+    /* Matrix-specific tweaks for compactness */
+    .matrix-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    .matrix-table thead th { position: sticky; top: 0; background: #0e141d; z-index: 2; }
+    .matrix-table thead tr.group-row th { top: 0; }
+    .matrix-table thead tr.header-row th { top: 30px; }
+    .matrix-table th, .matrix-table td { text-align: center; padding: 6px 8px; border-bottom: 1px solid #1e2733; font-size: 13px; }
+    .matrix-table td { font-variant-numeric: tabular-nums; }
+    .matrix-table td .num { display: block; line-height: 1.15; }
+    .matrix-table td .num.secondary { opacity: 0.85; font-size: 12px; }
+    .sticky-col { position: sticky; left: 0; background: #121822; z-index: 3; box-shadow: 1px 0 0 #1e2733; text-align: left; }
+    .col-narrow { min-width: 72px; max-width: 92px; overflow: hidden; text-overflow: ellipsis; }
+    .sortable { cursor: pointer; }
+    .sort-indicator { font-size: 10px; margin-left: 4px; opacity: 0.7; }
+  </style>
+  <script>
+    let apiKey = localStorage.getItem('api_key') || new URLSearchParams(location.search).get('key') || '';
+    if (apiKey) localStorage.setItem('api_key', apiKey);
+
+    function authHeaders() {
+      return apiKey ? { 'Authorization': 'Bearer ' + apiKey } : {};
+    }
+
+    async function fetchJSON(path) {
+      const res = await fetch(path + (path.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(apiKey), { headers: authHeaders() });
+      if (!res.ok) throw new Error(await res.text());
+      return await res.json();
+    }
+
+    // Sorting state for Eval Matrix
+    let sortKey = null;   // column key
+    let sortDir = 'desc'; // 'asc' | 'desc'
+
+    async function refresh() {
+      try {
+        const [sum, queue, evals, matrix] = await Promise.all([
+          fetchJSON('/ui/summary'),
+          fetchJSON('/ui/queue?limit=100'),
+          fetchJSON('/ui/evals?limit=50'),
+          fetchJSON('/ui/eval_matrix')
+        ]);
+        // Summary
+        document.getElementById('currentModel').textContent = sum.current_model || '(none)';
+        document.getElementById('runtimeReady').textContent = sum.runtime_ready ? 'ready' : 'not ready';
+        document.getElementById('runtimeReady').className = sum.runtime_ready ? 'ok' : 'bad';
+        document.getElementById('tokens').textContent = sum.tokens.toFixed(2);
+        document.getElementById('queueDepth').textContent = sum.queue_depth;
+        document.getElementById('lastRtAge').textContent = sum.last_rt_age_s.toFixed(1) + 's';
+        document.getElementById('ewmaRate').textContent = sum.lambda_ewma.toFixed(4) + ' 1/s';
+
+        // Queue by model (sampled)
+        const tbody = document.getElementById('queueByModel');
+        tbody.innerHTML = '';
+        sum.queue_by_model.forEach(row => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${row.model}</td><td>${row.count}</td>`;
+          tbody.appendChild(tr);
+        });
+
+        // Queue sample
+        const qbody = document.getElementById('queueSample');
+        qbody.innerHTML = '';
+        queue.items.forEach(it => {
+          const tr = document.createElement('tr');
+          const ts = it.submit_ts ? new Date(it.submit_ts * 1000).toLocaleTimeString() : '';
+          tr.innerHTML = `<td>${it.id}</td><td>${it.model}</td><td>${it.type}</td><td>${it.status}</td><td>${ts}</td>`;
+          qbody.appendChild(tr);
+        });
+
+        // Eval results matrix
+        const nonEmptyCols = new Set();
+        matrix.rows.forEach(r => {
+          matrix.columns.forEach(c => {
+            const cell = (r.data && r.data[c.key]) || {};
+            if (c.metrics && c.metrics.some(m => cell[m] !== undefined && cell[m] !== null)) {
+              nonEmptyCols.add(c.key);
+            }
+          });
+        });
+        const cols = matrix.columns.filter(c => nonEmptyCols.has(c.key));
+
+        // Group columns
+        const groups = [];
+        const groupMap = new Map();
+        const normalized = label => label.includes('•') ? label.split('•')[0].trim() : (label.toLowerCase().startsWith('euroeval') ? 'EuroEval' : 'Other');
+        cols.forEach(c => {
+          const g = normalized(c.label) || 'Other';
+          if (!groupMap.has(g)) {
+            groupMap.set(g, { name: g, cols: [] });
+            groups.push(groupMap.get(g));
+          }
+          groupMap.get(g).cols.push(c);
+        });
+
+        // Build header
+        const head = document.getElementById('evalMatrixHead');
+        const body = document.getElementById('evalMatrixBody');
+        head.innerHTML = '';
+        body.innerHTML = '';
+        const groupRow = document.createElement('tr');
+        groupRow.className = 'group-row';
+        groupRow.innerHTML = `<th class="sticky-col">Model</th>` + groups.map(grp => `<th colspan="${grp.cols.length}" title="${grp.name}" class="nowrap">${grp.name}</th>`).join('');
+        const colRow = document.createElement('tr');
+        colRow.className = 'header-row';
+        colRow.innerHTML = `<th class="sticky-col"></th>` + groups.map(grp => grp.cols.map(c => {
+          const parts = c.label.split('•');
+          const sub = (parts.length > 1 ? parts.slice(1).join('•') : c.label).trim();
+          const active = (sortKey === c.key);
+          const arrow = active ? (sortDir === 'asc' ? '▲' : '▼') : '';
+          const mtip = (c.metrics && c.metrics.length) ? `Metrics: ${c.metrics.join(', ')}` : '';
+          return `<th class="nowrap col-narrow sortable" data-key="${c.key}" title="${mtip}">${sub}${arrow ? `<span class=\"sort-indicator\">${arrow}</span>` : ''}</th>`;
+        }).join('')).join('');
+        head.appendChild(groupRow);
+        head.appendChild(colRow);
+
+        // Sort rows
+        const sortedRows = [...matrix.rows];
+        if (sortKey) {
+          const col = cols.find(c => c.key === sortKey);
+          const metric = col && col.metrics && col.metrics[0];
+          const val = (row) => {
+            const cell = (row.data && row.data[sortKey]) || {};
+            const v = metric ? cell[metric] : undefined;
+            return (typeof v === 'number') ? v : (v !== undefined && v !== null ? Number(v) : null);
+          };
+          sortedRows.sort((a, b) => {
+            const va = val(a); const vb = val(b);
+            const aHas = va !== null && !Number.isNaN(va);
+            const bHas = vb !== null && !Number.isNaN(vb);
+            if (aHas && bHas) return sortDir === 'asc' ? (va - vb) : (vb - va);
+            if (aHas && !bHas) return -1;
+            if (!aHas && bHas) return 1;
+            return 0;
+          });
+        }
+
+        // Rows
+        const fmt = x => (typeof x === 'number' ? (Math.abs(x) >= 1 ? x.toFixed(3) : x.toFixed(4)) : x);
+        sortedRows.forEach(row => {
+          const tr = document.createElement('tr');
+          let cells = `<td class="sticky-col nowrap">${row.model}</td>`;
+          groups.forEach(grp => {
+            grp.cols.forEach(c => {
+              const cell = (row.data && row.data[c.key]) || {};
+              const m1 = c.metrics && c.metrics[0];
+              const m2 = c.metrics && c.metrics[1];
+              const v1 = m1 !== undefined && cell[m1] !== undefined ? fmt(cell[m1]) : '–';
+              const v2 = m2 !== undefined && cell[m2] !== undefined ? fmt(cell[m2]) : '';
+              const title = (c.metrics && c.metrics.length) ? `${c.metrics[0] || ''}${m2 ? ', ' + c.metrics[1] : ''}` : '';
+              cells += `<td class="col-narrow" title="${title}"><span class="num primary">${v1}</span>${m2 ? `<span class="num secondary">${v2}</span>` : ''}</td>`;
+            });
+          });
+          tr.innerHTML = cells;
+          body.appendChild(tr);
+        });
+
+        // Bind sorting
+        head.querySelectorAll('th.sortable').forEach(th => {
+          th.addEventListener('click', () => {
+            const key = th.getAttribute('data-key');
+            if (sortKey === key) {
+              sortDir = (sortDir === 'asc') ? 'desc' : 'asc';
+            } else {
+              sortKey = key;
+              sortDir = 'desc';
+            }
+            refresh();
+          });
+        });
+
+        document.getElementById('error').textContent = '';
+      } catch (e) {
+        document.getElementById('error').textContent = e.toString();
+      }
+    }
+
+    function saveKey() {
+      const v = document.getElementById('apiKey').value.trim();
+      localStorage.setItem('api_key', v);
+      apiKey = v;
+      refresh();
+    }
+
+    window.addEventListener('load', () => {
+      document.getElementById('apiKey').value = apiKey;
+      refresh();
+      setInterval(refresh, 5000);
+    });
+  </script>
+</head>
+<body>
+  <h1>LLM Gateway Dashboard</h1>
+  <div class="row">
+    <div class="card">
+      <div class="kvs">
+        <div class="k">Current model</div> <div id="currentModel"></div>
+        <div class="k">Runtime</div> <div id="runtimeReady"></div>
+        <div class="k">Tokens</div> <div id="tokens"></div>
+        <div class="k">Queue depth</div> <div id="queueDepth"></div>
+        <div class="k">Last RT age</div> <div id="lastRtAge"></div>
+        <div class="k">EWMA λ</div> <div id="ewmaRate"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div style="margin-bottom:8px;">API key (stored locally):</div>
+      <input type="text" id="apiKey" placeholder="paste API key" />
+      <button onclick="saveKey()">Save</button>
+      <div id="error" style="margin-top:8px;color:#e74c3c;"></div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:12px;">
+    <div class="card" style="flex:1 1 100%">
+      <h3>Eval Results Matrix</h3>
+      <div class="scroll-x">
+        <table class="matrix-table">
+          <thead id="evalMatrixHead"></thead>
+          <tbody id="evalMatrixBody"></tbody>
+        </table>
+      </div>
+      <div class="muted" id="matrixHint">Showing latest results per model; columns expand nested evals.</div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:12px;">
+    <div class="card">
+      <h3>Queue by Model (sampled)</h3>
+      <table>
+        <thead><tr><th>Model</th><th>Queued</th></tr></thead>
+        <tbody id="queueByModel"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Queued Jobs (sample)</h3>
+      <table>
+        <thead><tr><th>ID</th><th>Model</th><th>Type</th><th>Status</th><th>Submitted</th></tr></thead>
+        <tbody id="queueSample"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:12px;">
+    <div class="card" style="flex:1 1 100%">
+      <h3>Recent Evaluation Jobs</h3>
+      <table>
+        <thead><tr><th>Job ID</th><th>Model</th><th>Status</th><th>Created</th></tr></thead>
+        <tbody id="evalTable"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="footer">Tip: Add ?key=YOUR_API_KEY to the URL for convenience.</div>
+</body>
+</html>

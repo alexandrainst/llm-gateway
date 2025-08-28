@@ -50,6 +50,7 @@ services:
       - ${HOST_HF_CACHE:-/home/alex-admin/.cache/huggingface}:/host_hf_cache:rw
       - ./orchestrator/app.py:/app/app.py:ro  # Mount app.py for hot reload
       - ./orchestrator/eval_manager.py:/app/eval_manager.py:ro  # Mount eval_manager.py
+      - ./orchestrator/static:/app/static:ro  # Serve UI assets
       - ./eval-repo:/home/alex-admin/llm-gateway/eval-repo:rw  # Mount eval repo for running evals (rw for venv creation)
       - ./EuroEval:/home/alex-admin/llm-gateway/EuroEval:ro  # Mount modified EuroEval package
       - ./data:/data:rw  # Mount data directory for eval results

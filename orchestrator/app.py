@@ -3,7 +3,8 @@ import os, time, uuid, json, asyncio, subprocess, socket, collections
 import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from fastapi import FastAPI, HTTPException, Response, Depends, APIRouter
+from fastapi import FastAPI, HTTPException, Response, Depends, APIRouter, Request, Query
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import redis.asyncio as aioredis
@@ -101,6 +102,26 @@ v1_router = APIRouter(prefix="/v1", dependencies=[Depends(verify_api_key)])
 
 # uploads: TUS protocol endpoints
 upload_router = APIRouter()
+ui_router = APIRouter()
+
+async def verify_api_key_flexible(
+    request: Request,
+    key: str | None = Query(default=None),
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+):
+    """Auth helper for UI JSON endpoints: accept Authorization header or ?key= query.
+    If API_KEY is unset, allow all.
+    """
+    if not API_KEY:
+        return True
+    provided = None
+    if key:
+        provided = key
+    elif credentials:
+        provided = credentials.credentials
+    if provided != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return True
 
 @app.get("/healthz")
 async def healthz():
@@ -108,9 +129,6 @@ async def healthz():
     return {"status": "ok"}
 
 # Mount routers
-app.include_router(v1_router)
-app.include_router(upload_router)
-app.include_router(eval_router)  # /eval endpoints
 
 class CompletionRequest(BaseModel):
     model: str
@@ -932,6 +950,524 @@ async def shutdown():
     if app.state.planner_task:
         app.state.planner_task.cancel()
         await asyncio.sleep(0.1)
+
+# ---------- UI Endpoints ----------
+@ui_router.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_page():
+    """Serve the dashboard UI from a static HTML file only."""
+    static_path = Path(__file__).parent / "static" / "dashboard.html"
+    if static_path.exists():
+        return FileResponse(static_path, media_type="text/html")
+    return HTMLResponse("Dashboard file not found (orchestrator/static/dashboard.html)", status_code=500)
+<!doctype html>
+<html>
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>LLM Gateway Dashboard</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #0b0f14; color: #e7eef5; }
+    h1 { margin: 0 0 12px 0; font-size: 20px; }
+    .row { display: flex; flex-wrap: wrap; gap: 12px; }
+    .card { background: #121822; border: 1px solid #1e2733; border-radius: 8px; padding: 12px; flex: 1 1 320px; }
+    .kvs { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: center; }
+    .k { color: #9fb0c3; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 6px 8px; border-bottom: 1px solid #1e2733; font-size: 13px; }
+    th { text-align: left; color: #9fb0c3; }
+    .ok { color: #2ecc71; }
+    .bad { color: #e74c3c; }
+    input[type=text] { width: 320px; padding: 6px 8px; border: 1px solid #1e2733; border-radius: 6px; background: #0b0f14; color: #e7eef5; }
+    button { padding: 6px 10px; background: #1e2733; color: #e7eef5; border: 1px solid #293445; border-radius: 6px; cursor: pointer; }
+    button:hover { background: #263041; }
+    .footer { margin-top: 16px; color: #73859a; font-size: 12px; }
+    .scroll-x { overflow-x: auto; }
+    .nowrap { white-space: nowrap; }
+    .muted { color: #9fb0c3; font-size: 12px; }
+    /* Matrix-specific tweaks for compactness */
+    .matrix-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    .matrix-table thead th { position: sticky; top: 0; background: #0e141d; z-index: 2; }
+    .matrix-table thead tr.group-row th { top: 0; }
+    .matrix-table thead tr.header-row th { top: 30px; }
+    .matrix-table th, .matrix-table td { text-align: center; padding: 6px 8px; border-bottom: 1px solid #1e2733; font-size: 13px; }
+    .matrix-table td { font-variant-numeric: tabular-nums; }
+    .matrix-table td .num { display: block; line-height: 1.15; }
+    .matrix-table td .num.secondary { opacity: 0.85; font-size: 12px; }
+    .sticky-col { position: sticky; left: 0; background: #121822; z-index: 3; box-shadow: 1px 0 0 #1e2733; text-align: left; }
+    .col-narrow { min-width: 72px; max-width: 92px; overflow: hidden; text-overflow: ellipsis; }
+    .sortable { cursor: pointer; }
+    .sort-indicator { font-size: 10px; margin-left: 4px; opacity: 0.7; }
+  </style>
+  <script>
+    let apiKey = localStorage.getItem('api_key') || new URLSearchParams(location.search).get('key') || '';
+    if (apiKey) localStorage.setItem('api_key', apiKey);
+
+    function authHeaders() {
+      return apiKey ? { 'Authorization': 'Bearer ' + apiKey } : {};
+    }
+
+    async function fetchJSON(path) {
+      const res = await fetch(path + (path.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(apiKey), { headers: authHeaders() });
+      if (!res.ok) throw new Error(await res.text());
+      return await res.json();
+    }
+
+    // Sorting state for Eval Matrix
+    let sortKey = null;   // column key
+    let sortDir = 'desc'; // 'asc' | 'desc'
+
+    async function refresh() {
+      try {
+        const [sum, queue, evals, matrix] = await Promise.all([
+          fetchJSON('/ui/summary'),
+          fetchJSON('/ui/queue?limit=100'),
+          fetchJSON('/ui/evals?limit=50'),
+          fetchJSON('/ui/eval_matrix')
+        ]);
+        // Summary
+        document.getElementById('currentModel').textContent = sum.current_model || '(none)';
+        document.getElementById('runtimeReady').textContent = sum.runtime_ready ? 'ready' : 'not ready';
+        document.getElementById('runtimeReady').className = sum.runtime_ready ? 'ok' : 'bad';
+        document.getElementById('tokens').textContent = sum.tokens.toFixed(2);
+        document.getElementById('queueDepth').textContent = sum.queue_depth;
+        document.getElementById('lastRtAge').textContent = sum.last_rt_age_s.toFixed(1) + 's';
+        document.getElementById('ewmaRate').textContent = sum.lambda_ewma.toFixed(4) + ' 1/s';
+
+        // Queue by model (sampled)
+        const tbody = document.getElementById('queueByModel');
+        tbody.innerHTML = '';
+        sum.queue_by_model.forEach(row => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${row.model}</td><td>${row.count}</td>`;
+          tbody.appendChild(tr);
+        });
+
+        // Queue sample
+        const qbody = document.getElementById('queueSample');
+        qbody.innerHTML = '';
+        queue.items.forEach(it => {
+          const tr = document.createElement('tr');
+          const ts = it.submit_ts ? new Date(it.submit_ts * 1000).toLocaleTimeString() : '';
+          tr.innerHTML = `<td>${it.id}</td><td>${it.model}</td><td>${it.type}</td><td>${it.status}</td><td>${ts}</td>`;
+          qbody.appendChild(tr);
+        });
+
+        // Recent eval jobs (brief)
+        const ebody = document.getElementById('evalTable');
+        ebody.innerHTML = '';
+        evals.items.forEach(e => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${e.job_id}</td><td>${e.model}</td><td>${e.status}</td><td>${e.created_at || ''}</td>`;
+          ebody.appendChild(tr);
+        });
+
+        // Eval results matrix
+        const head = document.getElementById('evalMatrixHead');
+        const body = document.getElementById('evalMatrixBody');
+        head.innerHTML = '';
+        body.innerHTML = '';
+
+        // Determine which columns have any data (to trim empty columns)
+        const nonEmptyCols = new Set();
+        matrix.rows.forEach(r => {
+          matrix.columns.forEach(c => {
+            const cell = (r.data && r.data[c.key]) || {};
+            if (c.metrics && c.metrics.some(m => cell[m] !== undefined && cell[m] !== null)) {
+              nonEmptyCols.add(c.key);
+            }
+          });
+        });
+        const cols = matrix.columns.filter(c => nonEmptyCols.has(c.key));
+
+        // Group columns by top-level group (before ' • ')
+        const groups = [];
+        const groupMap = new Map();
+        const normalized = label => label.includes('•') ? label.split('•')[0].trim() : (label.toLowerCase().startsWith('euroeval') ? 'EuroEval' : 'Other');
+        cols.forEach(c => {
+          const g = normalized(c.label) || 'Other';
+          if (!groupMap.has(g)) {
+            groupMap.set(g, { name: g, cols: [] });
+            groups.push(groupMap.get(g));
+          }
+          groupMap.get(g).cols.push(c);
+        });
+
+        // Build two-row header: group row and column row
+        const groupRow = document.createElement('tr');
+        groupRow.className = 'group-row';
+        groupRow.innerHTML = `<th class="sticky-col">Model</th>` + groups.map(grp => `<th colspan="${grp.cols.length}" title="${grp.name}" class="nowrap">${grp.name}</th>`).join('');
+        const colRow = document.createElement('tr');
+        colRow.className = 'header-row';
+        colRow.innerHTML = `<th class="sticky-col"></th>` + groups.map(grp => grp.cols.map(c => {
+          // Sub-label: text after ' • ' or whole label if no separator; hide metric names but include as tooltip
+          const parts = c.label.split('•');
+          const sub = (parts.length > 1 ? parts.slice(1).join('•') : c.label).trim();
+          const mtip = (c.metrics && c.metrics.length) ? `Metrics: ${c.metrics.join(', ')}` : '';
+          const active = (sortKey === c.key);
+          const arrow = active ? (sortDir === 'asc' ? '▲' : '▼') : '';
+          return `<th class="nowrap col-narrow sortable" data-key="${c.key}" title="${mtip}">${sub}${arrow ? ` <span class=\"sort-indicator\">${arrow}</span>` : ''}</th>`;
+        }).join('')).join('');
+        head.appendChild(groupRow);
+        head.appendChild(colRow);
+
+        // Build rows (supports sorting by selected column's primary metric)
+        const fmt = x => (typeof x === 'number' ? (Math.abs(x) >= 1 ? x.toFixed(3) : x.toFixed(4)) : x);
+        const rowsToRender = [...matrix.rows];
+        if (sortKey) {
+          const sel = cols.find(cc => cc.key === sortKey) || matrix.columns.find(cc => cc.key === sortKey);
+          const metric = sel && sel.metrics && sel.metrics[0];
+          const getVal = (row) => {
+            const cell = (row.data && row.data[sortKey]) || {};
+            const v = metric ? cell[metric] : undefined;
+            return (typeof v === 'number') ? v : (v !== undefined && v !== null ? Number(v) : null);
+          };
+          rowsToRender.sort((a, b) => {
+            const va = getVal(a); const vb = getVal(b);
+            const aHas = va !== null && !Number.isNaN(va);
+            const bHas = vb !== null && !Number.isNaN(vb);
+            if (aHas && bHas) return sortDir === 'asc' ? (va - vb) : (vb - va);
+            if (aHas && !bHas) return -1; // values first
+            if (!aHas && bHas) return 1;
+            return 0;
+          });
+        }
+        rowsToRender.forEach(row => {
+          const tr = document.createElement('tr');
+          let cells = `<td class="sticky-col nowrap">${row.model}</td>`;
+          groups.forEach(grp => {
+            grp.cols.forEach(c => {
+              const cell = (row.data && row.data[c.key]) || {};
+              const m1 = c.metrics && c.metrics[0];
+              const m2 = c.metrics && c.metrics[1];
+              const v1 = m1 !== undefined && cell[m1] !== undefined ? fmt(cell[m1]) : '–';
+              const v2 = m2 !== undefined && cell[m2] !== undefined ? fmt(cell[m2]) : '';
+              const title = (c.metrics && c.metrics.length) ? `${c.metrics[0] || ''}${m2 ? ', ' + c.metrics[1] : ''}` : '';
+              cells += `<td class="col-narrow" title="${title}"><span class="num primary">${v1}</span>${m2 ? `<span class="num secondary">${v2}</span>` : ''}</td>`;
+            });
+          });
+          tr.innerHTML = cells;
+          body.appendChild(tr);
+        });
+
+        // Bind sorting handlers
+        head.querySelectorAll('th.sortable').forEach(th => {
+          th.addEventListener('click', () => {
+            const key = th.getAttribute('data-key');
+            if (sortKey === key) {
+              sortDir = (sortDir === 'asc') ? 'desc' : 'asc';
+            } else {
+              sortKey = key;
+              sortDir = 'desc';
+            }
+            // Re-render table without refetching other panels
+            // Trigger a soft refresh to rebuild table area
+            // We reuse the same matrix object from current scope by re-running this block
+            // Simplest: re-call refresh() (it will rebuild quickly)
+            refresh();
+          });
+        });
+
+        document.getElementById('error').textContent = '';
+      } catch (e) {
+        document.getElementById('error').textContent = e.toString();
+      }
+    }
+
+    function saveKey() {
+      const v = document.getElementById('apiKey').value.trim();
+      localStorage.setItem('api_key', v);
+      apiKey = v;
+      refresh();
+    }
+
+    window.addEventListener('load', () => {
+      document.getElementById('apiKey').value = apiKey;
+      refresh();
+      setInterval(refresh, 5000);
+    });
+  </script>
+</head>
+<body>
+  <h1>LLM Gateway Dashboard</h1>
+  <div class="row">
+    <div class="card">
+      <div class="kvs">
+        <div class="k">Current model</div> <div id="currentModel"></div>
+        <div class="k">Runtime</div> <div id="runtimeReady"></div>
+        <div class="k">Tokens</div> <div id="tokens"></div>
+        <div class="k">Queue depth</div> <div id="queueDepth"></div>
+        <div class="k">Last RT age</div> <div id="lastRtAge"></div>
+        <div class="k">EWMA λ</div> <div id="ewmaRate"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div style="margin-bottom:8px;">API key (stored locally):</div>
+      <input type="text" id="apiKey" placeholder="paste API key" />
+      <button onclick="saveKey()">Save</button>
+      <div id="error" style="margin-top:8px;color:#e74c3c;"></div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:12px;">
+    <div class="card" style="flex:1 1 100%">
+      <h3>Eval Results Matrix</h3>
+      <div class="scroll-x">
+        <table class="matrix-table">
+          <thead id="evalMatrixHead"></thead>
+          <tbody id="evalMatrixBody"></tbody>
+        </table>
+      </div>
+      <div class="muted" id="matrixHint">Showing latest results per model; columns expand nested evals.</div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:12px;">
+    <div class="card">
+      <h3>Queue by Model (sampled)</h3>
+      <table>
+        <thead><tr><th>Model</th><th>Queued</th></tr></thead>
+        <tbody id="queueByModel"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Queued Jobs (sample)</h3>
+      <table>
+        <thead><tr><th>ID</th><th>Model</th><th>Type</th><th>Status</th><th>Submitted</th></tr></thead>
+        <tbody id="queueSample"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:12px;">
+    <div class="card" style="flex:1 1 100%">
+      <h3>Recent Evaluation Jobs</h3>
+      <table>
+        <thead><tr><th>Job ID</th><th>Model</th><th>Status</th><th>Created</th></tr></thead>
+        <tbody id="evalTable"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="footer">Tip: Add ?key=YOUR_API_KEY to the URL for convenience.</div>
+</body>
+</html>
+    """
+    return HTMLResponse(content=html)
+
+@ui_router.get("/ui/summary")
+async def ui_summary(auth: bool = Depends(verify_api_key_flexible)):
+    """Summarized state for the dashboard."""
+    current = state.get("current_model")
+    ready = is_runtime_ready()
+    tokens_val = float(state.get("tokens", 0.0))
+    lam = float(state.get("lambda_ewma", 0.0))
+    last_ts = float(state.get("last_rt_ts", 0.0))
+    last_age = max(0.0, now() - last_ts) if last_ts > 0 else -1.0
+    depth = await redis.zcard(BATCH_ZSET) if redis else 0
+
+    # Sample a subset of queue to build counts per model
+    sample_n = 500
+    queued_ids = await redis.zrange(BATCH_ZSET, 0, sample_n - 1) if redis else []
+    counts: dict[str,int] = {}
+    for jid in queued_ids:
+        h = await redis.hgetall(JOB_HASH_PREFIX + jid)
+        mid = h.get("model") if h else None
+        if mid:
+            counts[mid] = counts.get(mid, 0) + 1
+    queue_by_model = [ {"model": m, "count": c} for m, c in sorted(counts.items(), key=lambda x: x[1], reverse=True) ]
+
+    return {
+        "current_model": current,
+        "runtime_ready": bool(ready),
+        "tokens": tokens_val,
+        "lambda_ewma": lam,
+        "last_rt_age_s": last_age,
+        "queue_depth": depth,
+        "queue_by_model": queue_by_model,
+    }
+
+@ui_router.get("/ui/queue")
+async def ui_queue(limit: int = 100, auth: bool = Depends(verify_api_key_flexible)):
+    """Return a sample of queued jobs (and statuses)."""
+    ids = await redis.zrange(BATCH_ZSET, 0, max(0, limit - 1)) if redis else []
+    items = []
+    for jid in ids:
+        h = await redis.hgetall(JOB_HASH_PREFIX + jid)
+        if not h:
+            continue
+        items.append({
+            "id": jid,
+            "model": h.get("model"),
+            "status": h.get("status"),
+            "priority": int(h.get("priority", 0)) if h.get("priority") else 0,
+            "type": h.get("type", "completion"),
+            "submit_ts": float(h.get("submit_ts", 0.0)) if h.get("submit_ts") else None,
+        })
+    return {"items": items, "queued_total": await redis.zcard(BATCH_ZSET)}
+
+@ui_router.get("/ui/evals")
+async def ui_evals(limit: int = 50, auth: bool = Depends(verify_api_key_flexible)):
+    """List evaluation jobs by scanning eval_job:* keys (best-effort)."""
+    items = []
+    if not redis:
+        return {"items": items}
+    cursor = 0
+    scanned = 0
+    results = []
+    while True:
+        cursor, keys = await redis.scan(cursor, match="eval_job:*", count=200)
+        for k in keys:
+            try:
+                data = await redis.get(k)
+                if not data:
+                    continue
+                job = json.loads(data)
+                results.append({
+                    "job_id": job.get("job_id"),
+                    "model": job.get("model"),
+                    "status": job.get("status"),
+                    "created_at": job.get("created_at"),
+                })
+            except Exception:
+                continue
+            scanned += 1
+        if cursor == 0 or len(results) >= limit:
+            break
+    # Sort by created_at desc
+    def _key(j):
+        return j.get("created_at") or ""
+    results.sort(key=_key, reverse=True)
+    return {"items": results[:limit]}
+
+@ui_router.get("/ui/eval_matrix")
+async def ui_eval_matrix(auth: bool = Depends(verify_api_key_flexible)):
+    """Return an aggregated matrix of latest eval results.
+    Rows = models, Columns = evals (including nested expansions, e.g., euroeval datasets).
+    Each column exposes up to two metrics chosen by priority.
+    """
+    base = Path("/data/eval_results")
+    if not base.exists():
+        return {"columns": [], "rows": [], "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+    # Helpers
+    metric_priority = [
+        "accuracy", "acc", "strict_accuracy", "macro_f1", "f1",
+        "exact_match", "em", "score", "bleu", "rougeL", "pearson", "spearman"
+    ]
+
+    def pick_metrics(candidates: set[str]) -> list[str]:
+        # Choose up to 2 by priority; if fewer available, fill by sorted name
+        chosen = []
+        for m in metric_priority:
+            if m in candidates:
+                chosen.append(m)
+            if len(chosen) == 2:
+                return chosen
+        # Fill from remaining (deterministic order)
+        remaining = sorted([m for m in candidates if m not in chosen])
+        for m in remaining:
+            chosen.append(m)
+            if len(chosen) == 2:
+                break
+        return chosen
+
+    # Collect per-model results and available column metrics
+    columns: dict[str, dict] = {}  # key -> {label, metrics_set:set}
+    rows_map: dict[str, dict] = {}  # model -> {col_key -> {metric->value}}
+
+    for model_dir in base.iterdir():
+        if not model_dir.is_dir():
+            continue
+        # Resolve latest
+        latest_dir = None
+        latest_link = model_dir / "latest"
+        try:
+            if latest_link.exists():
+                latest_dir = latest_link.resolve()
+        except Exception:
+            latest_dir = None
+        if latest_dir is None or not latest_dir.exists():
+            # Fallback: pick most recent timestamp directory
+            subdirs = [d for d in model_dir.iterdir() if d.is_dir()]
+            if not subdirs:
+                continue
+            latest_dir = sorted(subdirs)[-1]
+
+        # Load all *_results.json
+        for f in latest_dir.glob("*_results.json"):
+            try:
+                with open(f, "r") as fh:
+                    data = json.load(fh)
+            except Exception:
+                continue
+            model_name = data.get("model") or model_dir.name
+            eval_name = data.get("eval_name", "")
+            metrics = data.get("metrics", {}) or {}
+            if not isinstance(metrics, dict) or not metrics:
+                continue
+
+            # Ensure row exists
+            rows_map.setdefault(model_name, {})
+
+            if eval_name == "euroeval":
+                # Expand dataset-prefixed metrics: <dataset>_<metric>
+                by_ds: dict[str, dict] = {}
+                for k, v in metrics.items():
+                    if not isinstance(v, (int, float)):
+                        continue
+                    if "_" not in k:
+                        # Skip non-dataset metrics for matrix
+                        continue
+                    ds, m = k.split("_", 1)
+                    if not ds:
+                        continue
+                    by_ds.setdefault(ds, {})[m] = v
+                for ds, mvals in by_ds.items():
+                    col_key = f"euroeval:{ds}"
+                    col_label = f"euroeval • {ds}"
+                    c = columns.setdefault(col_key, {"label": col_label, "metrics_set": set()})
+                    c["metrics_set"].update(list(mvals.keys()))
+                    # Store row values
+                    rows_map[model_name].setdefault(col_key, {})
+                    rows_map[model_name][col_key].update(mvals)
+            else:
+                # Flat eval
+                col_key = eval_name or f.name.replace("_results.json", "")
+                col_label = eval_name or col_key
+                numeric = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
+                if not numeric:
+                    continue
+                c = columns.setdefault(col_key, {"label": col_label, "metrics_set": set()})
+                c["metrics_set"].update(list(numeric.keys()))
+                rows_map[model_name].setdefault(col_key, {})
+                rows_map[model_name][col_key].update(numeric)
+
+    # Finalize columns with chosen metrics
+    ordered_cols = []
+    for key, meta in columns.items():
+        metrics_list = pick_metrics(set(meta.get("metrics_set", set())))
+        ordered_cols.append({"key": key, "label": meta.get("label", key), "metrics": metrics_list})
+    # Stable order: euroeval groups first (alphabetical), then others
+    def col_sort(c):
+        return (0 if c["key"].startswith("euroeval:") else 1, c["label"]) 
+    ordered_cols.sort(key=col_sort)
+
+    # Build rows
+    rows = []
+    for model in sorted(rows_map.keys()):
+        entry = {"model": model, "data": {}}
+        for col in ordered_cols:
+            col_key = col["key"]
+            src = rows_map[model].get(col_key, {})
+            # Only include chosen metrics
+            entry["data"][col_key] = {m: src.get(m) for m in col["metrics"] if m in src}
+        rows.append(entry)
+
+    return {
+        "columns": ordered_cols,
+        "rows": rows,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    }
 
 @v1_router.get("/models")
 async def list_models(auth: bool = Depends(verify_api_key)):
@@ -1890,3 +2426,9 @@ async def _finalize_upload(upload_id: str, upload_data: dict):
         # Cleanup temp file
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
+# Mount routers after all endpoints have been defined
+app.include_router(v1_router)
+app.include_router(upload_router)
+app.include_router(eval_router)  # /eval endpoints
+app.include_router(ui_router)
