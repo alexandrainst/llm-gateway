@@ -160,21 +160,23 @@ async def cleanup_stuck_jobs():
     """Clean up any jobs stuck in 'running' state from previous orchestrator run."""
     cleaned_count = 0
     
-    # Clean up stuck batch jobs
+    # Clean up stuck batch jobs (hashes under job:*)
     cursor = 0
     while True:
-        cursor, keys = await redis.scan(cursor, match="batch_job:*", count=100)
+        cursor, keys = await redis.scan(cursor, match=f"{JOB_HASH_PREFIX}*", count=200)
         for key in keys:
-            job_data = await redis.hgetall(key)
-            if job_data.get("status") == "running":
-                # Mark as error - the orchestrator restarted while it was running
-                await redis.hset(key, mapping={
-                    "status": "error",
-                    "error": "Orchestrator restarted",
-                    "finished_ts": str(now())
-                })
-                cleaned_count += 1
-                log.info(f"Cleaned up stuck batch job: {key.decode() if isinstance(key, bytes) else key}")
+            try:
+                job_data = await redis.hgetall(key)
+                if job_data and job_data.get("status") == "running":
+                    await redis.hset(key, mapping={
+                        "status": "error",
+                        "error": "Orchestrator restarted",
+                        "finished_ts": str(now())
+                    })
+                    cleaned_count += 1
+                    log.info("cleaned_stuck_batch_job", key=key)
+            except Exception as e:
+                log.warning("cleanup_batch_job_error", key=key, error=str(e))
         if cursor == 0:
             break
     
@@ -190,14 +192,14 @@ async def cleanup_stuck_jobs():
                     eval_data["error"] = "Orchestrator restarted during evaluation"
                     await redis.set(key, json.dumps(eval_data))
                     cleaned_count += 1
-                    log.info(f"Cleaned up stuck eval job: {key.decode() if isinstance(key, bytes) else key}")
+                    log.info("cleaned_stuck_eval_job", key=key)
             except Exception as e:
                 log.error(f"Error cleaning eval job {key}: {e}")
         if cursor == 0:
             break
     
     if cleaned_count > 0:
-        log.info(f"Cleaned up {cleaned_count} stuck jobs from previous run")
+        log.info("cleaned_stuck_jobs_total", count=cleaned_count)
 
 def ewma_update_interarrival(delta_t):
     if delta_t <= 0:
