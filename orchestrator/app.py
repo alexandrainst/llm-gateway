@@ -1,5 +1,5 @@
 # orchestrator/app.py
-import os, time, uuid, json, asyncio, subprocess, socket
+import os, time, uuid, json, asyncio, subprocess, socket, collections
 import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -31,6 +31,7 @@ L_MAX_S = int(os.getenv("L_MAX_S", "600"))
 P_MAX = float(os.getenv("P_MAX", "0.3"))
 TOKENS_B = float(os.getenv("TOKENS_B", "2"))
 REFILL_PER_SEC = float(os.getenv("TOKENS_REFILL_PER_SEC", "0.000555"))
+MAX_CONCURRENT_BATCH = int(os.getenv("MAX_CONCURRENT_BATCH", "64"))
 
 BATCH_ZSET = "z:batchjobs"
 JOB_HASH_PREFIX = "job:"
@@ -451,21 +452,41 @@ async def wait_for_runtime_ready(timeout=600):
                     
                     if exit_code == 137 or "out of memory" in logs.lower() or "oom" in logs.lower() or "CUDA out of memory" in logs:
                         log.error("runtime_oom", model=model, exit_code=exit_code, logs=logs[-500:])
+                        try:
+                            if model:
+                                model_failures.labels(model=model, reason="oom").inc()
+                        except Exception:
+                            pass
                         # Mark model as OOM for 24 hours
                         if model:
                             await redis.set(f"model_oom:{model}", str(now()), ex=86400)
                     elif "has no SGlang implementation" in logs or "not compatible with SGLang" in logs:
                         log.error("model_not_supported", model=model, exit_code=exit_code, logs=logs[-500:])
+                        try:
+                            if model:
+                                model_failures.labels(model=model, reason="incompatible").inc()
+                        except Exception:
+                            pass
                         # Mark model as incompatible permanently (30 days)
                         if model:
                             await redis.set(f"model_incompatible:{model}", str(now()), ex=2592000)
                     elif exit_code == 139:
                         log.error("runtime_segfault", model=model, exit_code=exit_code, logs=logs[-500:])
+                        try:
+                            if model:
+                                model_failures.labels(model=model, reason="segfault").inc()
+                        except Exception:
+                            pass
                         # Segfault might be model-specific, mark for 6 hours
                         if model:
                             await redis.set(f"model_failure:{model}", str(now()), ex=21600)
                     else:
                         log.error("runtime_crashed", model=model, exit_code=exit_code, logs=logs[-500:])
+                        try:
+                            if model:
+                                model_failures.labels(model=model, reason="crashed").inc()
+                        except Exception:
+                            pass
                         # Mark model as failed for 1 hour (might be transient)
                         if model:
                             await redis.set(f"model_failure:{model}", str(now()), ex=3600)
@@ -798,12 +819,20 @@ async def load_realtime_model_async():
     """Load and warm up the realtime model on startup"""
     try:
         await prefetch_pagecache_async(REALTIME_MODEL)
+        t0 = time.time()
         await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(REALTIME_MODEL))
         # vLLM needs more time to start up
         startup_timeout = 300 if RUNTIME_TYPE == "vllm" else 120
         ok = await wait_for_runtime_ready(timeout=startup_timeout)
         if ok:
             state["current_model"] = REALTIME_MODEL
+            try:
+                model_load_time.labels(model=REALTIME_MODEL).observe(time.time() - t0)
+                # Count as a switch if we came from something else
+                # (on cold start previous may be None)
+                model_switches.inc()
+            except Exception:
+                pass
             log.info("realtime_model_loaded_on_startup", model=REALTIME_MODEL)
     except Exception as e:
         log.error("failed_to_load_realtime_on_startup", error=str(e))
@@ -824,10 +853,18 @@ async def ensure_realtime_model_loading():
             log.info("starting_realtime_model_load", model=REALTIME_MODEL)
             await prefetch_pagecache_async(REALTIME_MODEL)
             await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
+            t0 = time.time()
             await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(REALTIME_MODEL))
             ok = await wait_for_runtime_ready(timeout=60)
             if ok:
+                prev_model = state.get("current_model")
                 state["current_model"] = REALTIME_MODEL
+                try:
+                    model_load_time.labels(model=REALTIME_MODEL).observe(time.time() - t0)
+                    if prev_model != REALTIME_MODEL:
+                        model_switches.inc()
+                except Exception:
+                    pass
                 log.info("realtime_model_ready", model=REALTIME_MODEL)
         except Exception as e:
             log.error("realtime_model_load_failed", error=str(e))
@@ -1152,6 +1189,10 @@ async def batch_planner_loop():
                 last_storage_check = current_time
 
             queued = await redis.zrange(BATCH_ZSET, 0, -1)
+            try:
+                queue_depth.labels(type="batch").set(len(queued))
+            except Exception:
+                pass
             if not queued:
                 await asyncio.sleep(1.0)
                 continue
@@ -1320,6 +1361,7 @@ async def batch_planner_loop():
                 log.info("stopping_runtime_for_batch", current_model=state.get("current_model"))
                 await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
                 try:
+                    t0 = time.time()
                     await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(best_model))
                 except Exception as e:
                     # requeue claimed jobs with original submit time
@@ -1341,7 +1383,14 @@ async def batch_planner_loop():
                     await asyncio.sleep(1.0)
                     continue
 
+                prev_model = state.get("current_model")
                 state["current_model"] = best_model
+                try:
+                    model_load_time.labels(model=best_model).observe(time.time() - t0)
+                    if prev_model != best_model:
+                        model_switches.inc()
+                except Exception:
+                    pass
             else:
                 # Already on the right model, just check it's ready
                 ok = await wait_for_runtime_ready(timeout=10)
@@ -1371,84 +1420,104 @@ async def batch_planner_loop():
                     log.info("prefetching_next_model_pagecache", current=best_model, next=next_model)
                     asyncio.create_task(prefetch_pagecache_async(next_model))
 
-            # Process claimed jobs concurrently with max concurrency using semaphore
-            MAX_CONCURRENT_BATCH = 200
-            semaphore = asyncio.Semaphore(MAX_CONCURRENT_BATCH)
-            
+            # Process jobs with a bounded number of inflight requests; keep pipeline full
             async def process_batch_job(jid):
-                """Process a single batch job with semaphore-controlled concurrency"""
-                async with semaphore:
-                    # Check for preemption
-                    if state.get("preempt"):
-                        # Requeue this job
+                # Check for preemption early
+                if state.get("preempt"):
+                    job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                    if job_data:
+                        original_ts = float(job_data.get("submit_ts", now()))
+                        await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
+                        await redis.zadd(BATCH_ZSET, {jid: original_ts})
+                    return
+                
+                jobh = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                if not jobh:
+                    return
+                
+                job_type = jobh.get("type", "completion")
+                try:
+                    if job_type == "completion":
+                        request_data = {
+                            "model": jobh.get("model", best_model),
+                            "prompt": jobh.get("prompt", ""),
+                            "max_tokens": int(jobh.get("max_tokens", 100)),
+                            "temperature": float(jobh.get("temperature", 0.7)),
+                            "top_p": float(jobh.get("top_p", 1.0)),
+                            "n": int(jobh.get("n", 1)),
+                            "stop": json.loads(jobh.get("stop", "null"))
+                        }
+                        res = await runtime_proxy("/v1/completions", request_data)
+                    else:
+                        request_data = {
+                            "model": jobh.get("model", best_model), 
+                            "messages": json.loads(jobh.get("messages", "[]")),
+                            "max_tokens": int(jobh.get("max_tokens", 100)),
+                            "temperature": float(jobh.get("temperature", 0.7)),
+                            "top_p": float(jobh.get("top_p", 1.0)),
+                            "n": int(jobh.get("n", 1)),
+                            "stop": json.loads(jobh.get("stop", "null"))
+                        }
+                        res = await runtime_proxy("/v1/chat/completions", request_data)
+                    
+                    if jobh.get("eval_name"):
+                        debug_log = "/tmp/eval_debug.log"
+                        with open(debug_log, "a") as f:
+                            f.write(f"\n[{now()}] Job {jid} for eval {jobh.get('eval_name')}\n")
+                            f.write(f"Request max_tokens: {jobh.get('max_tokens', 'not set')}\n")
+                            if "choices" in res and res["choices"]:
+                                content = res["choices"][0].get("message", {}).get("content", "") if "message" in res["choices"][0] else res["choices"][0].get("text", "")
+                                f.write(f"Response content length: {len(content)}\n")
+                                f.write(f"Response content (first 200 chars): {content[:200]!r}\n")
+                                f.write(f"Finish reason: {res['choices'][0].get('finish_reason', 'unknown')}\n")
+                            else:
+                                f.write(f"No choices in response: {json.dumps(res)[:500]}\n")
+                    
+                    await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "completed", "result": json.dumps(res), "finished_ts": str(now())})
+                    try:
+                        jobs_total.labels(status="completed", type=job_type).inc()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "error", "error": str(e), "finished_ts": str(now())})
+                    try:
+                        jobs_total.labels(status="error", type=job_type).inc()
+                    except Exception:
+                        pass
+
+            # Keep up to MAX_CONCURRENT_BATCH inflight; refill as tasks finish
+            seg_t0 = time.time()
+            pending = collections.deque(claimed)
+            active = set()
+            # Prime
+            while pending and len(active) < MAX_CONCURRENT_BATCH and not state.get("preempt"):
+                jid = pending.popleft()
+                t = asyncio.create_task(process_batch_job(jid))
+                active.add(t)
+            # Loop until drained
+            while active:
+                done, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                active -= done
+                # Refill
+                while pending and len(active) < MAX_CONCURRENT_BATCH and not state.get("preempt"):
+                    jid = pending.popleft()
+                    t = asyncio.create_task(process_batch_job(jid))
+                    active.add(t)
+                # If preempting, requeue not-started jobs
+                if state.get("preempt") and pending:
+                    for jid in list(pending):
                         job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
                         if job_data:
                             original_ts = float(job_data.get("submit_ts", now()))
                             await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
                             await redis.zadd(BATCH_ZSET, {jid: original_ts})
-                        return
-                    
-                    jobh = await redis.hgetall(JOB_HASH_PREFIX + jid)
-                    if not jobh:
-                        return
-                    
-                    # Reconstruct the request based on job type
-                    job_type = jobh.get("type", "completion")
-                    try:
-                        if job_type == "completion":
-                            # Build completions request
-                            request_data = {
-                                "model": jobh.get("model", best_model),
-                                "prompt": jobh.get("prompt", ""),
-                                "max_tokens": int(jobh.get("max_tokens", 100)),
-                                "temperature": float(jobh.get("temperature", 0.7)),
-                                "top_p": float(jobh.get("top_p", 1.0)),
-                                "n": int(jobh.get("n", 1)),
-                                "stop": json.loads(jobh.get("stop", "null"))
-                            }
-                            res = await runtime_proxy("/v1/completions", request_data)
-                        else:  # chat_completion
-                            # Build chat completions request
-                            request_data = {
-                                "model": jobh.get("model", best_model), 
-                                "messages": json.loads(jobh.get("messages", "[]")),
-                                "max_tokens": int(jobh.get("max_tokens", 100)),
-                                "temperature": float(jobh.get("temperature", 0.7)),
-                                "top_p": float(jobh.get("top_p", 1.0)),
-                                "n": int(jobh.get("n", 1)),
-                                "stop": json.loads(jobh.get("stop", "null"))
-                            }
-                            res = await runtime_proxy("/v1/chat/completions", request_data)
-                        
-                        # Debug logging for eval responses
-                        if jobh.get("eval_name"):
-                            debug_log = "/tmp/eval_debug.log"
-                            with open(debug_log, "a") as f:
-                                f.write(f"\n[{now()}] Job {jid} for eval {jobh.get('eval_name')}\n")
-                                f.write(f"Request max_tokens: {jobh.get('max_tokens', 'not set')}\n")
-                                if "choices" in res and res["choices"]:
-                                    content = res["choices"][0].get("message", {}).get("content", "") if "message" in res["choices"][0] else res["choices"][0].get("text", "")
-                                    f.write(f"Response content length: {len(content)}\n")
-                                    f.write(f"Response content (first 200 chars): {content[:200]!r}\n")
-                                    f.write(f"Finish reason: {res['choices'][0].get('finish_reason', 'unknown')}\n")
-                                else:
-                                    f.write(f"No choices in response: {json.dumps(res)[:500]}\n")
-                        
-                        await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "completed", "result": json.dumps(res), "finished_ts": str(now())})
-                    except Exception as e:
-                        await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "error", "error": str(e), "finished_ts": str(now())})
-            
-            # Start all jobs concurrently - semaphore will limit actual concurrency
-            tasks = [asyncio.create_task(process_batch_job(jid)) for jid in claimed]
-            
-            # Wait for all tasks to complete or preemption
-            try:
-                await asyncio.gather(*tasks)
-            except asyncio.CancelledError:
-                # If cancelled due to preemption, tasks will handle their own cleanup
-                pass
+                    pending.clear()
 
             # After batch work is done, return to realtime model
+            try:
+                batch_segment_duration.observe(time.time() - seg_t0)
+            except Exception:
+                pass
             log.info("batch_segment_complete", model=best_model, jobs_processed=len(claimed))
             
             # Return to realtime model if no more batch work
@@ -1457,10 +1526,18 @@ async def batch_planner_loop():
                 log.info("no_batch_jobs_remaining_loading_realtime")
                 await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
                 try:
+                    t0 = time.time()
                     await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(REALTIME_MODEL))
                     ok = await wait_for_runtime_ready(timeout=60)
                     if ok:
+                        prev_model = state.get("current_model")
                         state["current_model"] = REALTIME_MODEL
+                        try:
+                            model_load_time.labels(model=REALTIME_MODEL).observe(time.time() - t0)
+                            if prev_model != REALTIME_MODEL:
+                                model_switches.inc()
+                        except Exception:
+                            pass
                         log.info("returned_to_realtime", model=REALTIME_MODEL)
                 except Exception as e:
                     log.error("failed_to_return_to_realtime", error=str(e))
