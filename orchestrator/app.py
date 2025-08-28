@@ -875,7 +875,16 @@ async def metrics(auth: bool = Depends(verify_api_key)):
 @app.post("/v1/completions")
 async def completions(req: CompletionRequest, response: Response, auth: bool = Depends(verify_api_key)):
     """OpenAI-compatible completions endpoint"""
-    # TODO: Add EWMA tracking for inter-arrival times and token bucket refill (from old /generate endpoint)
+    # Update realtime arrival tracking for EWMA + hot TTL
+    try:
+        t_now = now()
+        prev = state.get("last_rt_ts", 0.0) or 0.0
+        if prev > 0:
+            ewma_update_interarrival(t_now - prev)
+        state["last_rt_ts"] = t_now
+    except Exception:
+        # Non-fatal; keep request path resilient
+        pass
     # Check if request is for realtime model
     if req.model != REALTIME_MODEL:
         # If not realtime model, could enqueue as batch or reject
@@ -908,6 +917,16 @@ async def completions(req: CompletionRequest, response: Response, auth: bool = D
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, response: Response, auth: bool = Depends(verify_api_key)):
     """OpenAI-compatible chat completions endpoint"""
+    # Update realtime arrival tracking for EWMA + hot TTL
+    try:
+        t_now = now()
+        prev = state.get("last_rt_ts", 0.0) or 0.0
+        if prev > 0:
+            ewma_update_interarrival(t_now - prev)
+        state["last_rt_ts"] = t_now
+    except Exception:
+        # Non-fatal; keep request path resilient
+        pass
     # Check if request is for realtime model
     if req.model != REALTIME_MODEL:
         raise HTTPException(status_code=400, detail=f"Model {req.model} not available for realtime. Use /v1/jobs for batch processing.")
