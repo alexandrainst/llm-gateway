@@ -57,20 +57,40 @@
 
     async function refresh() {
       try {
-        const [sum, queue, evals, matrix] = await Promise.all([
+        const [sum, evals, matrix, logs] = await Promise.all([
           fetchJSON('/ui/summary'),
-          fetchJSON('/ui/queue?limit=100'),
           fetchJSON('/ui/evals?limit=50'),
-          fetchJSON('/ui/eval_matrix')
+          fetchJSON('/ui/eval_matrix'),
+          fetchJSON('/ui/runtime/logs?tail=200')
         ]);
         // Summary
         document.getElementById('currentModel').textContent = sum.current_model || '(none)';
-        document.getElementById('runtimeReady').textContent = sum.runtime_ready ? 'ready' : 'not ready';
+        document.getElementById('runtimeReady').textContent = sum.runtime_status || (sum.runtime_ready ? 'ready' : 'not ready');
         document.getElementById('runtimeReady').className = sum.runtime_ready ? 'ok' : 'bad';
+        // Loading and Next model indicators
+        const loadingEl = document.getElementById('loadingModel');
+        const nextEl = document.getElementById('nextModel');
+        if (loadingEl) loadingEl.textContent = sum.loading_model || '-';
+        if (nextEl) nextEl.textContent = sum.next_model || '-';
+        // Active requests
+        const inflightEl = document.getElementById('inflight');
+        if (inflightEl) inflightEl.textContent = `${sum.inflight_total || 0} (rt:${sum.inflight_realtime || 0}, batch:${sum.inflight_batch || 0})`;
+        const lastActEl = document.getElementById('lastRuntime');
+        if (lastActEl) lastActEl.textContent = (sum.last_runtime_req_age_s != null) ? `${sum.last_runtime_req_age_s.toFixed(1)}s` : '-';
         document.getElementById('tokens').textContent = sum.tokens.toFixed(2);
         document.getElementById('queueDepth').textContent = sum.queue_depth;
         document.getElementById('lastRtAge').textContent = sum.last_rt_age_s.toFixed(1) + 's';
         document.getElementById('ewmaRate').textContent = sum.lambda_ewma.toFixed(4) + ' 1/s';
+
+        // Runtime logs (unless paused)
+        const pause = document.getElementById('pauseLogs');
+        const logEl = document.getElementById('runtimeLogs');
+        const statusEl = document.getElementById('logStatus');
+        if (statusEl) statusEl.textContent = logs.container_status || '';
+        if (logEl && !(pause && pause.checked)) {
+          logEl.textContent = logs.text || '';
+          logEl.scrollTop = logEl.scrollHeight;
+        }
 
         // Queue by model (sampled)
         const tbody = document.getElementById('queueByModel');
@@ -81,15 +101,7 @@
           tbody.appendChild(tr);
         });
 
-        // Queue sample
-        const qbody = document.getElementById('queueSample');
-        qbody.innerHTML = '';
-        queue.items.forEach(it => {
-          const tr = document.createElement('tr');
-          const ts = it.submit_ts ? new Date(it.submit_ts * 1000).toLocaleTimeString() : '';
-          tr.innerHTML = `<td>${it.id}</td><td>${it.model}</td><td>${it.type}</td><td>${it.status}</td><td>${ts}</td>`;
-          qbody.appendChild(tr);
-        });
+        // Removed queued jobs sample table (noisy, not very useful)
 
         // Eval results matrix
         const nonEmptyCols = new Set();
@@ -198,6 +210,32 @@
       }
     }
 
+    async function submitEval() {
+      const model = (document.getElementById('evalModel')?.value || '').trim();
+      const msg = document.getElementById('evalSubmitMsg');
+      if (!model) {
+        if (msg) msg.textContent = 'Please enter a model id';
+        return;
+      }
+      try {
+        const res = await fetch('/eval/submit', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(apiKey ? { 'Authorization': 'Bearer ' + apiKey } : {})
+          },
+          body: JSON.stringify({ model, api_key: apiKey })
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        if (msg) msg.textContent = `Submitted: ${data.job_id}`;
+        // Refresh lists soon after
+        setTimeout(refresh, 1000);
+      } catch (e) {
+        if (msg) msg.textContent = 'Error: ' + e.toString();
+      }
+    }
+
     function saveKey() {
       const v = document.getElementById('apiKey').value.trim();
       localStorage.setItem('api_key', v);
@@ -219,7 +257,11 @@
       <div class="kvs">
         <div class="k">Current model</div> <div id="currentModel"></div>
         <div class="k">Runtime</div> <div id="runtimeReady"></div>
+        <div class="k">Loading</div> <div id="loadingModel"></div>
+        <div class="k">Next</div> <div id="nextModel"></div>
         <div class="k">Tokens</div> <div id="tokens"></div>
+        <div class="k">Inflight</div> <div id="inflight"></div>
+        <div class="k">Last runtime</div> <div id="lastRuntime"></div>
         <div class="k">Queue depth</div> <div id="queueDepth"></div>
         <div class="k">Last RT age</div> <div id="lastRtAge"></div>
         <div class="k">EWMA λ</div> <div id="ewmaRate"></div>
@@ -247,6 +289,19 @@
   </div>
 
   <div class="row" style="margin-top:12px;">
+    <div class="card" style="flex:1 1 100%">
+      <h3>Submit Evaluation</h3>
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <label for="evalModel" class="k">Model</label>
+        <input type="text" id="evalModel" placeholder="e.g., gemma-3-4b-dfm-v1-7" style="width:360px">
+        <button onclick="submitEval()">Submit</button>
+        <span id="evalSubmitMsg" class="muted"></span>
+      </div>
+      <div class="muted" style="margin-top:6px">Tip: model must exist on disk (uploaded or HF cached). Uses the saved API key to authorize and pass to scoring.</div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:12px;">
     <div class="card">
       <h3>Queue by Model (sampled)</h3>
       <table>
@@ -254,12 +309,15 @@
         <tbody id="queueByModel"></tbody>
       </table>
     </div>
-    <div class="card">
-      <h3>Queued Jobs (sample)</h3>
-      <table>
-        <thead><tr><th>ID</th><th>Model</th><th>Type</th><th>Status</th><th>Submitted</th></tr></thead>
-        <tbody id="queueSample"></tbody>
-      </table>
+  </div>
+
+  <div class="row" style="margin-top:12px;">
+    <div class="card" style="flex:1 1 100%">
+      <h3>Runtime Logs <span class="muted" style="font-weight:normal">(status: <span id="logStatus"></span>)</span></h3>
+      <div style="margin-bottom:6px">
+        <label><input type="checkbox" id="pauseLogs"> Pause auto-refresh</label>
+      </div>
+      <pre id="runtimeLogs" style="height:240px; overflow-y:auto; background:#0b0f14; border:1px solid #1e2733; padding:8px; border-radius:6px; white-space:pre-wrap;"></pre>
     </div>
   </div>
 

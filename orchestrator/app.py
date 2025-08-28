@@ -13,6 +13,7 @@ import docker
 from docker.types import DeviceRequest
 import structlog
 from prometheus_client import Counter, Histogram, Gauge, generate_latest
+from model_utils import detect_is_base_model
 from eval_manager import EvalManager, router as eval_router
 
 log = structlog.get_logger()
@@ -55,7 +56,13 @@ state = {
     "current_model": None,
     "preempt": False,
     "loading_task": None,  # Track if model is already loading
-    "loading_model": None  # Track which model is being loaded
+    "loading_model": None,  # Track which model is being loaded
+    # Runtime activity tracking
+    "inflight_realtime": 0,
+    "inflight_batch": 0,
+    "last_runtime_req_ts": 0.0,
+    "last_runtime_ok_ts": 0.0,
+    "last_runtime_err_ts": 0.0,
 }
 
 # ============ Prometheus Metrics ============
@@ -430,10 +437,8 @@ async def send_warmup_request():
     try:
         runtime_host = get_runtime_host()
         runtime_url = f"http://{runtime_host}:{RUNTIME_PORT}"
-        
         # Get the actual model name from the runtime
         async with httpx.AsyncClient(timeout=30) as client:
-            # First get the model name from the runtime
             models_response = await client.get(f"{runtime_url}/v1/models")
             if models_response.status_code == 200:
                 models_data = models_response.json()
@@ -443,58 +448,22 @@ async def send_warmup_request():
                     model_name = state.get("current_model", "model")
             else:
                 model_name = state.get("current_model", "model")
-            
-            # Check if this is a base model by looking for chat_template in tokenizer config
-            # (Same logic as eval_manager uses)
-            is_base_model = False
-            current_model = state.get("current_model") or state.get("loading_model")
-            if current_model:
-                # Check if it's an uploaded model first
-                import redis as sync_redis
-                try:
-                    sync_redis_client = sync_redis.from_url(REDIS_URL, decode_responses=True)
-                    model_meta = sync_redis_client.hgetall(f"{MODEL_META_PREFIX}{current_model}")
-                    sync_redis_client.close()
-                    
-                    if model_meta and model_meta.get("type") == "uploaded":
-                        # For uploaded models, check tokenizer_config.json
-                        model_dir = f"/host_hf_cache/hub/models--{current_model.replace('/', '--')}"
-                        tokenizer_config_path = f"{model_dir}/snapshots/main/tokenizer_config.json"
-                        if os.path.exists(tokenizer_config_path):
-                            with open(tokenizer_config_path) as f:
-                                config = json.load(f)
-                                is_base_model = config.get("chat_template") is None
-                except Exception:
-                    pass
-            
-            # Send appropriate warmup based on model type
-            if is_base_model:
-                # Base model - use completion endpoint
-                warmup_data = {
-                    "model": model_name,
-                    "prompt": "Hello",
-                    "max_tokens": 1,
-                    "temperature": 0
-                }
+
+            # Determine base vs instruction using local tokenizer_config.json
+            current_model_id = state.get("current_model") or state.get("loading_model") or model_name
+            is_base = detect_is_base_model(current_model_id)
+            if is_base:
+                warmup_data = {"model": model_name, "prompt": "Hello", "max_tokens": 1, "temperature": 0}
                 endpoint = "/v1/completions"
             else:
-                # Instruction model - use chat endpoint
-                warmup_data = {
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": "Hello"}],
-                    "max_tokens": 1,
-                    "temperature": 0
-                }
+                warmup_data = {"model": model_name, "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 1, "temperature": 0}
                 endpoint = "/v1/chat/completions"
-            
-            response = await client.post(
-                f"{runtime_url}{endpoint}",
-                json=warmup_data
-            )
+
+            response = await client.post(f"{runtime_url}{endpoint}", json=warmup_data)
             if response.status_code == 200:
-                log.info("warmup_request_sent", model=model_name, is_base=is_base_model)
+                log.info("warmup_request_sent", model=model_name, endpoint=endpoint, is_base=is_base)
             else:
-                log.warning("warmup_request_failed", status=response.status_code, model=model_name, is_base=is_base_model)
+                log.warning("warmup_request_failed", model=model_name, endpoint=endpoint, status=response.status_code, is_base=is_base)
     except Exception as e:
         log.warning("warmup_request_error", error=str(e))
 
@@ -582,29 +551,58 @@ async def wait_for_runtime_ready(timeout=600):
     log.error("runtime_timeout", host=runtime_host, timeout=timeout)
     return False
 
-async def runtime_proxy(endpoint: str, payload: dict, timeout=120):
-    """Proxy OpenAI-compatible requests directly to runtime"""
+async def runtime_proxy(endpoint: str, payload: dict, timeout=120, source: str = "unknown"):
+    """Proxy OpenAI-compatible requests directly to runtime.
+    Tracks inflight counts and last activity for transparency.
+    source: 'realtime' | 'batch' | 'unknown'
+    """
     from fastapi.responses import StreamingResponse
     runtime_host = get_runtime_host()
     url = f"http://{runtime_host}:{RUNTIME_PORT}{endpoint}"
+    # Update inflight counters
+    if source == "realtime":
+        state["inflight_realtime"] = max(0, state.get("inflight_realtime", 0)) + 1
+    elif source == "batch":
+        state["inflight_batch"] = max(0, state.get("inflight_batch", 0)) + 1
+    state["last_runtime_req_ts"] = now()
     
     # Check if this is a streaming request
     if payload.get("stream", False):
         # For streaming, we need to proxy the stream
         async def stream_generator():
-            async with httpx.AsyncClient() as client:
-                async with client.stream("POST", url, json=payload, timeout=timeout) as r:
-                    r.raise_for_status()
-                    async for chunk in r.aiter_bytes():
-                        yield chunk
+            try:
+                async with httpx.AsyncClient() as client:
+                    async with client.stream("POST", url, json=payload, timeout=timeout) as r:
+                        r.raise_for_status()
+                        async for chunk in r.aiter_bytes():
+                            yield chunk
+                state["last_runtime_ok_ts"] = now()
+            except Exception:
+                state["last_runtime_err_ts"] = now()
+                raise
+            finally:
+                if source == "realtime":
+                    state["inflight_realtime"] = max(0, state.get("inflight_realtime", 0) - 1)
+                elif source == "batch":
+                    state["inflight_batch"] = max(0, state.get("inflight_batch", 0) - 1)
         
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
     else:
         # Non-streaming request
-        async with httpx.AsyncClient() as client:
-            r = await client.post(url, json=payload, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(url, json=payload, timeout=timeout)
+                r.raise_for_status()
+                state["last_runtime_ok_ts"] = now()
+                return r.json()
+        except Exception:
+            state["last_runtime_err_ts"] = now()
+            raise
+        finally:
+            if source == "realtime":
+                state["inflight_realtime"] = max(0, state.get("inflight_realtime", 0) - 1)
+            elif source == "batch":
+                state["inflight_batch"] = max(0, state.get("inflight_batch", 0) - 1)
 
 # ---------- prefetch (page-cache) ----------
 def prefetch_pagecache_blocking(model_id):
@@ -718,6 +716,51 @@ async def download_model_async(model_id: str) -> bool:
         else:
             log.error("model_download_failed", model_id=model_id, error=error_msg)
         return False
+
+def detect_is_base_model(model_id: str) -> bool:
+    """Detect if a model is a base (no chat template) by inspecting tokenizer_config.json
+    in the local HF cache for both uploaded (snapshots/main) and HF-downloaded (snapshots/<hash>) cases.
+    Returns True for base models (no chat_template), False for instruction/chat models.
+    """
+    try:
+        base_dir = os.path.join("/host_hf_cache", "hub", f"models--{model_id.replace('/', '--')}")
+        snapshots_dir = os.path.join(base_dir, "snapshots")
+        if not os.path.isdir(snapshots_dir):
+            return True  # default to base if we cannot determine
+
+        # Prefer uploads path first
+        main_dir = os.path.join(snapshots_dir, "main")
+        candidates = []
+        if os.path.isdir(main_dir):
+            candidates.append(main_dir)
+        # Then add hashed snapshot dirs (sorted by mtime desc)
+        hashes = []
+        for name in os.listdir(snapshots_dir):
+            p = os.path.join(snapshots_dir, name)
+            if name == "main":
+                continue
+            if os.path.isdir(p):
+                try:
+                    hashes.append((os.path.getmtime(p), p))
+                except Exception:
+                    hashes.append((0, p))
+        hashes.sort(key=lambda x: x[0], reverse=True)
+        candidates.extend([p for _, p in hashes])
+
+        for snap in candidates:
+            tok_cfg = os.path.join(snap, "tokenizer_config.json")
+            if os.path.exists(tok_cfg):
+                try:
+                    with open(tok_cfg, "r") as f:
+                        cfg = json.load(f)
+                    # Base model if chat_template missing or None
+                    return cfg.get("chat_template") is None
+                except Exception:
+                    continue
+        # If no tokenizer_config.json found, default to base
+        return True
+    except Exception:
+        return True
 
 def get_model_size_on_disk(model_id: str) -> int:
     """Get size of model on disk in bytes"""
@@ -958,307 +1001,30 @@ async def dashboard_page():
     static_path = Path(__file__).parent / "static" / "dashboard.html"
     if static_path.exists():
         return FileResponse(static_path, media_type="text/html")
-    return HTMLResponse("Dashboard file not found (orchestrator/static/dashboard.html)", status_code=500)
-<!doctype html>
-<html>
-<head>
-  <meta charset=\"utf-8\">
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-  <title>LLM Gateway Dashboard</title>
-  <style>
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #0b0f14; color: #e7eef5; }
-    h1 { margin: 0 0 12px 0; font-size: 20px; }
-    .row { display: flex; flex-wrap: wrap; gap: 12px; }
-    .card { background: #121822; border: 1px solid #1e2733; border-radius: 8px; padding: 12px; flex: 1 1 320px; }
-    .kvs { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: center; }
-    .k { color: #9fb0c3; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 6px 8px; border-bottom: 1px solid #1e2733; font-size: 13px; }
-    th { text-align: left; color: #9fb0c3; }
-    .ok { color: #2ecc71; }
-    .bad { color: #e74c3c; }
-    input[type=text] { width: 320px; padding: 6px 8px; border: 1px solid #1e2733; border-radius: 6px; background: #0b0f14; color: #e7eef5; }
-    button { padding: 6px 10px; background: #1e2733; color: #e7eef5; border: 1px solid #293445; border-radius: 6px; cursor: pointer; }
-    button:hover { background: #263041; }
-    .footer { margin-top: 16px; color: #73859a; font-size: 12px; }
-    .scroll-x { overflow-x: auto; }
-    .nowrap { white-space: nowrap; }
-    .muted { color: #9fb0c3; font-size: 12px; }
-    /* Matrix-specific tweaks for compactness */
-    .matrix-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-    .matrix-table thead th { position: sticky; top: 0; background: #0e141d; z-index: 2; }
-    .matrix-table thead tr.group-row th { top: 0; }
-    .matrix-table thead tr.header-row th { top: 30px; }
-    .matrix-table th, .matrix-table td { text-align: center; padding: 6px 8px; border-bottom: 1px solid #1e2733; font-size: 13px; }
-    .matrix-table td { font-variant-numeric: tabular-nums; }
-    .matrix-table td .num { display: block; line-height: 1.15; }
-    .matrix-table td .num.secondary { opacity: 0.85; font-size: 12px; }
-    .sticky-col { position: sticky; left: 0; background: #121822; z-index: 3; box-shadow: 1px 0 0 #1e2733; text-align: left; }
-    .col-narrow { min-width: 72px; max-width: 92px; overflow: hidden; text-overflow: ellipsis; }
-    .sortable { cursor: pointer; }
-    .sort-indicator { font-size: 10px; margin-left: 4px; opacity: 0.7; }
-  </style>
-  <script>
-    let apiKey = localStorage.getItem('api_key') || new URLSearchParams(location.search).get('key') || '';
-    if (apiKey) localStorage.setItem('api_key', apiKey);
-
-    function authHeaders() {
-      return apiKey ? { 'Authorization': 'Bearer ' + apiKey } : {};
-    }
-
-    async function fetchJSON(path) {
-      const res = await fetch(path + (path.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(apiKey), { headers: authHeaders() });
-      if (!res.ok) throw new Error(await res.text());
-      return await res.json();
-    }
-
-    // Sorting state for Eval Matrix
-    let sortKey = null;   // column key
-    let sortDir = 'desc'; // 'asc' | 'desc'
-
-    async function refresh() {
-      try {
-        const [sum, queue, evals, matrix] = await Promise.all([
-          fetchJSON('/ui/summary'),
-          fetchJSON('/ui/queue?limit=100'),
-          fetchJSON('/ui/evals?limit=50'),
-          fetchJSON('/ui/eval_matrix')
-        ]);
-        // Summary
-        document.getElementById('currentModel').textContent = sum.current_model || '(none)';
-        document.getElementById('runtimeReady').textContent = sum.runtime_ready ? 'ready' : 'not ready';
-        document.getElementById('runtimeReady').className = sum.runtime_ready ? 'ok' : 'bad';
-        document.getElementById('tokens').textContent = sum.tokens.toFixed(2);
-        document.getElementById('queueDepth').textContent = sum.queue_depth;
-        document.getElementById('lastRtAge').textContent = sum.last_rt_age_s.toFixed(1) + 's';
-        document.getElementById('ewmaRate').textContent = sum.lambda_ewma.toFixed(4) + ' 1/s';
-
-        // Queue by model (sampled)
-        const tbody = document.getElementById('queueByModel');
-        tbody.innerHTML = '';
-        sum.queue_by_model.forEach(row => {
-          const tr = document.createElement('tr');
-          tr.innerHTML = `<td>${row.model}</td><td>${row.count}</td>`;
-          tbody.appendChild(tr);
-        });
-
-        // Queue sample
-        const qbody = document.getElementById('queueSample');
-        qbody.innerHTML = '';
-        queue.items.forEach(it => {
-          const tr = document.createElement('tr');
-          const ts = it.submit_ts ? new Date(it.submit_ts * 1000).toLocaleTimeString() : '';
-          tr.innerHTML = `<td>${it.id}</td><td>${it.model}</td><td>${it.type}</td><td>${it.status}</td><td>${ts}</td>`;
-          qbody.appendChild(tr);
-        });
-
-        // Recent eval jobs (brief)
-        const ebody = document.getElementById('evalTable');
-        ebody.innerHTML = '';
-        evals.items.forEach(e => {
-          const tr = document.createElement('tr');
-          tr.innerHTML = `<td>${e.job_id}</td><td>${e.model}</td><td>${e.status}</td><td>${e.created_at || ''}</td>`;
-          ebody.appendChild(tr);
-        });
-
-        // Eval results matrix
-        const head = document.getElementById('evalMatrixHead');
-        const body = document.getElementById('evalMatrixBody');
-        head.innerHTML = '';
-        body.innerHTML = '';
-
-        // Determine which columns have any data (to trim empty columns)
-        const nonEmptyCols = new Set();
-        matrix.rows.forEach(r => {
-          matrix.columns.forEach(c => {
-            const cell = (r.data && r.data[c.key]) || {};
-            if (c.metrics && c.metrics.some(m => cell[m] !== undefined && cell[m] !== null)) {
-              nonEmptyCols.add(c.key);
-            }
-          });
-        });
-        const cols = matrix.columns.filter(c => nonEmptyCols.has(c.key));
-
-        // Group columns by top-level group (before ' • ')
-        const groups = [];
-        const groupMap = new Map();
-        const normalized = label => label.includes('•') ? label.split('•')[0].trim() : (label.toLowerCase().startsWith('euroeval') ? 'EuroEval' : 'Other');
-        cols.forEach(c => {
-          const g = normalized(c.label) || 'Other';
-          if (!groupMap.has(g)) {
-            groupMap.set(g, { name: g, cols: [] });
-            groups.push(groupMap.get(g));
-          }
-          groupMap.get(g).cols.push(c);
-        });
-
-        // Build two-row header: group row and column row
-        const groupRow = document.createElement('tr');
-        groupRow.className = 'group-row';
-        groupRow.innerHTML = `<th class="sticky-col">Model</th>` + groups.map(grp => `<th colspan="${grp.cols.length}" title="${grp.name}" class="nowrap">${grp.name}</th>`).join('');
-        const colRow = document.createElement('tr');
-        colRow.className = 'header-row';
-        colRow.innerHTML = `<th class="sticky-col"></th>` + groups.map(grp => grp.cols.map(c => {
-          // Sub-label: text after ' • ' or whole label if no separator; hide metric names but include as tooltip
-          const parts = c.label.split('•');
-          const sub = (parts.length > 1 ? parts.slice(1).join('•') : c.label).trim();
-          const mtip = (c.metrics && c.metrics.length) ? `Metrics: ${c.metrics.join(', ')}` : '';
-          const active = (sortKey === c.key);
-          const arrow = active ? (sortDir === 'asc' ? '▲' : '▼') : '';
-          return `<th class="nowrap col-narrow sortable" data-key="${c.key}" title="${mtip}">${sub}${arrow ? ` <span class=\"sort-indicator\">${arrow}</span>` : ''}</th>`;
-        }).join('')).join('');
-        head.appendChild(groupRow);
-        head.appendChild(colRow);
-
-        // Build rows (supports sorting by selected column's primary metric)
-        const fmt = x => (typeof x === 'number' ? (Math.abs(x) >= 1 ? x.toFixed(3) : x.toFixed(4)) : x);
-        const rowsToRender = [...matrix.rows];
-        if (sortKey) {
-          const sel = cols.find(cc => cc.key === sortKey) || matrix.columns.find(cc => cc.key === sortKey);
-          const metric = sel && sel.metrics && sel.metrics[0];
-          const getVal = (row) => {
-            const cell = (row.data && row.data[sortKey]) || {};
-            const v = metric ? cell[metric] : undefined;
-            return (typeof v === 'number') ? v : (v !== undefined && v !== null ? Number(v) : null);
-          };
-          rowsToRender.sort((a, b) => {
-            const va = getVal(a); const vb = getVal(b);
-            const aHas = va !== null && !Number.isNaN(va);
-            const bHas = vb !== null && !Number.isNaN(vb);
-            if (aHas && bHas) return sortDir === 'asc' ? (va - vb) : (vb - va);
-            if (aHas && !bHas) return -1; // values first
-            if (!aHas && bHas) return 1;
-            return 0;
-          });
-        }
-        rowsToRender.forEach(row => {
-          const tr = document.createElement('tr');
-          let cells = `<td class="sticky-col nowrap">${row.model}</td>`;
-          groups.forEach(grp => {
-            grp.cols.forEach(c => {
-              const cell = (row.data && row.data[c.key]) || {};
-              const m1 = c.metrics && c.metrics[0];
-              const m2 = c.metrics && c.metrics[1];
-              const v1 = m1 !== undefined && cell[m1] !== undefined ? fmt(cell[m1]) : '–';
-              const v2 = m2 !== undefined && cell[m2] !== undefined ? fmt(cell[m2]) : '';
-              const title = (c.metrics && c.metrics.length) ? `${c.metrics[0] || ''}${m2 ? ', ' + c.metrics[1] : ''}` : '';
-              cells += `<td class="col-narrow" title="${title}"><span class="num primary">${v1}</span>${m2 ? `<span class="num secondary">${v2}</span>` : ''}</td>`;
-            });
-          });
-          tr.innerHTML = cells;
-          body.appendChild(tr);
-        });
-
-        // Bind sorting handlers
-        head.querySelectorAll('th.sortable').forEach(th => {
-          th.addEventListener('click', () => {
-            const key = th.getAttribute('data-key');
-            if (sortKey === key) {
-              sortDir = (sortDir === 'asc') ? 'desc' : 'asc';
-            } else {
-              sortKey = key;
-              sortDir = 'desc';
-            }
-            // Re-render table without refetching other panels
-            // Trigger a soft refresh to rebuild table area
-            // We reuse the same matrix object from current scope by re-running this block
-            // Simplest: re-call refresh() (it will rebuild quickly)
-            refresh();
-          });
-        });
-
-        document.getElementById('error').textContent = '';
-      } catch (e) {
-        document.getElementById('error').textContent = e.toString();
-      }
-    }
-
-    function saveKey() {
-      const v = document.getElementById('apiKey').value.trim();
-      localStorage.setItem('api_key', v);
-      apiKey = v;
-      refresh();
-    }
-
-    window.addEventListener('load', () => {
-      document.getElementById('apiKey').value = apiKey;
-      refresh();
-      setInterval(refresh, 5000);
-    });
-  </script>
-</head>
-<body>
-  <h1>LLM Gateway Dashboard</h1>
-  <div class="row">
-    <div class="card">
-      <div class="kvs">
-        <div class="k">Current model</div> <div id="currentModel"></div>
-        <div class="k">Runtime</div> <div id="runtimeReady"></div>
-        <div class="k">Tokens</div> <div id="tokens"></div>
-        <div class="k">Queue depth</div> <div id="queueDepth"></div>
-        <div class="k">Last RT age</div> <div id="lastRtAge"></div>
-        <div class="k">EWMA λ</div> <div id="ewmaRate"></div>
-      </div>
-    </div>
-    <div class="card">
-      <div style="margin-bottom:8px;">API key (stored locally):</div>
-      <input type="text" id="apiKey" placeholder="paste API key" />
-      <button onclick="saveKey()">Save</button>
-      <div id="error" style="margin-top:8px;color:#e74c3c;"></div>
-    </div>
-  </div>
-
-  <div class="row" style="margin-top:12px;">
-    <div class="card" style="flex:1 1 100%">
-      <h3>Eval Results Matrix</h3>
-      <div class="scroll-x">
-        <table class="matrix-table">
-          <thead id="evalMatrixHead"></thead>
-          <tbody id="evalMatrixBody"></tbody>
-        </table>
-      </div>
-      <div class="muted" id="matrixHint">Showing latest results per model; columns expand nested evals.</div>
-    </div>
-  </div>
-
-  <div class="row" style="margin-top:12px;">
-    <div class="card">
-      <h3>Queue by Model (sampled)</h3>
-      <table>
-        <thead><tr><th>Model</th><th>Queued</th></tr></thead>
-        <tbody id="queueByModel"></tbody>
-      </table>
-    </div>
-    <div class="card">
-      <h3>Queued Jobs (sample)</h3>
-      <table>
-        <thead><tr><th>ID</th><th>Model</th><th>Type</th><th>Status</th><th>Submitted</th></tr></thead>
-        <tbody id="queueSample"></tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="row" style="margin-top:12px;">
-    <div class="card" style="flex:1 1 100%">
-      <h3>Recent Evaluation Jobs</h3>
-      <table>
-        <thead><tr><th>Job ID</th><th>Model</th><th>Status</th><th>Created</th></tr></thead>
-        <tbody id="evalTable"></tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="footer">Tip: Add ?key=YOUR_API_KEY to the URL for convenience.</div>
-</body>
-</html>
-    """
-    return HTMLResponse(content=html)
+    return HTMLResponse("Dashboard file not found (orchestrator/static/dashboard.html)", status_code=500) 
 
 @ui_router.get("/ui/summary")
 async def ui_summary(auth: bool = Depends(verify_api_key_flexible)):
     """Summarized state for the dashboard."""
     current = state.get("current_model")
-    ready = is_runtime_ready()
+    # Container status + quick HTTP health
+    container_status = "not_found"
+    try:
+        c = docker_client.containers.get(CONTAINER_NAME)
+        container_status = c.attrs.get("State", {}).get("Status", getattr(c, "status", "unknown"))
+    except docker.errors.NotFound:
+        container_status = "not_found"
+
+    http_ok = False
+    try:
+        runtime_host = get_runtime_host()
+        async with httpx.AsyncClient(timeout=0.5) as client:
+            r = await client.get(f"http://{runtime_host}:{RUNTIME_PORT}/v1/models")
+            http_ok = (r.status_code == 200)
+    except Exception:
+        http_ok = False
+
+    ready = (container_status == "running" and http_ok)
     tokens_val = float(state.get("tokens", 0.0))
     lam = float(state.get("lambda_ewma", 0.0))
     last_ts = float(state.get("last_rt_ts", 0.0))
@@ -1276,9 +1042,44 @@ async def ui_summary(auth: bool = Depends(verify_api_key_flexible)):
             counts[mid] = counts.get(mid, 0) + 1
     queue_by_model = [ {"model": m, "count": c} for m, c in sorted(counts.items(), key=lambda x: x[1], reverse=True) ]
 
+    # Best guess for next/target model based on queue sample
+    next_model = queue_by_model[0]["model"] if queue_by_model else None
+
+    # Loading state
+    loading_model = state.get("loading_model")
+    switching = bool(state.get("loading_task"))
+
+    # Derive a friendly runtime status string
+    if ready:
+        runtime_status = "ready"
+    elif switching and loading_model:
+        runtime_status = f"loading {loading_model}"
+    elif container_status in ("created", "restarting"):
+        runtime_status = "starting"
+    elif container_status == "running":
+        runtime_status = "initializing"
+    elif container_status == "exited":
+        runtime_status = "stopped"
+    elif container_status == "not_found":
+        runtime_status = "not running"
+    else:
+        runtime_status = container_status or "unknown"
+
     return {
         "current_model": current,
         "runtime_ready": bool(ready),
+        "runtime_status": runtime_status,
+        "container_status": container_status,
+        "runtime_http_ok": http_ok,
+        "loading_model": loading_model,
+        "switching": switching,
+        "next_model": next_model,
+        "inflight_realtime": int(state.get("inflight_realtime", 0)),
+        "inflight_batch": int(state.get("inflight_batch", 0)),
+        "inflight_total": int(state.get("inflight_realtime", 0)) + int(state.get("inflight_batch", 0)),
+        "last_runtime_req_age_s": (now() - state.get("last_runtime_req_ts", 0.0)) if state.get("last_runtime_req_ts", 0.0) else None,
+        "last_runtime_ok_age_s": (now() - state.get("last_runtime_ok_ts", 0.0)) if state.get("last_runtime_ok_ts", 0.0) else None,
+        "last_runtime_err_age_s": (now() - state.get("last_runtime_err_ts", 0.0)) if state.get("last_runtime_err_ts", 0.0) else None,
         "tokens": tokens_val,
         "lambda_ewma": lam,
         "last_rt_age_s": last_age,
@@ -1338,6 +1139,35 @@ async def ui_evals(limit: int = 50, auth: bool = Depends(verify_api_key_flexible
         return j.get("created_at") or ""
     results.sort(key=_key, reverse=True)
     return {"items": results[:limit]}
+
+@ui_router.get("/ui/runtime/logs")
+async def ui_runtime_logs(
+    tail: int = 200,
+    since_s: float | None = None,
+    auth: bool = Depends(verify_api_key_flexible),
+):
+    """Return recent runtime container logs for the UI (auth-protected).
+    Params:
+      - tail: number of lines from the end (default 200)
+      - since_s: only logs since now - since_s seconds
+    """
+    try:
+        c = docker_client.containers.get(CONTAINER_NAME)
+        status = c.attrs.get("State", {}).get("Status", getattr(c, "status", "unknown"))
+        kwargs = {"tail": tail, "timestamps": True}
+        if since_s and since_s > 0:
+            import time as _time
+            kwargs["since"] = int(_time.time() - float(since_s))
+        raw = c.logs(**kwargs)
+        text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        # Soft limit to avoid huge payloads
+        if len(text) > 120_000:
+            text = text[-120_000:]
+        return {"container_status": status, "text": text, "tail": tail}
+    except docker.errors.NotFound:
+        return {"container_status": "not_found", "text": "(runtime container not found)", "tail": tail}
+    except Exception as e:
+        return {"container_status": "error", "text": f"(error fetching logs: {e})", "tail": tail}
 
 @ui_router.get("/ui/eval_matrix")
 async def ui_eval_matrix(auth: bool = Depends(verify_api_key_flexible)):
@@ -1523,7 +1353,7 @@ async def completions(req: CompletionRequest, response: Response, auth: bool = D
     # Check if realtime model is hot
     if state.get("current_model") == REALTIME_MODEL and is_runtime_ready():
         try:
-            return await runtime_proxy("/v1/completions", req.dict())
+            return await runtime_proxy("/v1/completions", req.dict(), source="realtime")
         except httpx.ConnectError as e:
             # Runtime is actually down
             log.error("completions_proxy_connect_error", error=str(e))
@@ -1564,7 +1394,7 @@ async def chat_completions(req: ChatCompletionRequest, response: Response, auth:
     # Check if realtime model is hot
     if state.get("current_model") == REALTIME_MODEL and is_runtime_ready():
         try:
-            return await runtime_proxy("/v1/chat/completions", req.dict())
+            return await runtime_proxy("/v1/chat/completions", req.dict(), source="realtime")
         except httpx.ConnectError as e:
             # Runtime is actually down
             log.error("chat_completions_proxy_connect_error", error=str(e))
@@ -1780,6 +1610,27 @@ async def batch_planner_loop():
             except Exception:
                 pass
             if not queued:
+                # If there are no batch jobs and we're not on the realtime model, switch back proactively
+                if state.get("current_model") and state.get("current_model") != REALTIME_MODEL:
+                    try:
+                        log.info("no_batch_jobs_switching_to_realtime_proactive",
+                                 from_model=state.get("current_model"), to_model=REALTIME_MODEL)
+                        await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
+                        t0 = time.time()
+                        await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(REALTIME_MODEL))
+                        ok = await wait_for_runtime_ready(timeout=60)
+                        if ok:
+                            prev_model = state.get("current_model")
+                            state["current_model"] = REALTIME_MODEL
+                            try:
+                                model_load_time.labels(model=REALTIME_MODEL).observe(time.time() - t0)
+                                if prev_model != REALTIME_MODEL:
+                                    model_switches.inc()
+                            except Exception:
+                                pass
+                            log.info("returned_to_realtime_proactive", model=REALTIME_MODEL)
+                    except Exception as e:
+                        log.error("failed_switch_to_realtime_proactive", error=str(e))
                 await asyncio.sleep(1.0)
                 continue
             
@@ -1807,12 +1658,28 @@ async def batch_planner_loop():
                 failure_key = f"model_failure:{mid}"
                 oom_key = f"model_oom:{mid}"
                 incompatible_key = f"model_incompatible:{mid}"
-                
-                if await redis.get(failure_key) or await redis.get(oom_key) or await redis.get(incompatible_key):
-                    log.debug("skipping_failed_model", model=mid, 
-                             failure=bool(await redis.get(failure_key)),
-                             oom=bool(await redis.get(oom_key)),
-                             incompatible=bool(await redis.get(incompatible_key)))
+
+                failure = await redis.get(failure_key)
+                oom = await redis.get(oom_key)
+                incompatible = await redis.get(incompatible_key)
+
+                # If prior failure was a download/availability issue but the model is now on disk,
+                # clear the transient failure flag so the scheduler can proceed.
+                if failure and check_model_on_disk(mid):
+                    try:
+                        await redis.delete(failure_key)
+                        failure = None
+                    except Exception:
+                        pass
+
+                if failure or oom or incompatible:
+                    log.debug(
+                        "skipping_failed_model",
+                        model=mid,
+                        failure=bool(failure),
+                        oom=bool(oom),
+                        incompatible=bool(incompatible),
+                    )
                     continue
                     
                 job_count = len(items)
@@ -2033,7 +1900,7 @@ async def batch_planner_loop():
                             "n": int(jobh.get("n", 1)),
                             "stop": json.loads(jobh.get("stop", "null"))
                         }
-                        res = await runtime_proxy("/v1/completions", request_data)
+                        res = await runtime_proxy("/v1/completions", request_data, source="batch")
                     else:
                         request_data = {
                             "model": jobh.get("model", best_model), 
@@ -2044,7 +1911,7 @@ async def batch_planner_loop():
                             "n": int(jobh.get("n", 1)),
                             "stop": json.loads(jobh.get("stop", "null"))
                         }
-                        res = await runtime_proxy("/v1/chat/completions", request_data)
+                        res = await runtime_proxy("/v1/chat/completions", request_data, source="batch")
                     
                     if jobh.get("eval_name"):
                         debug_log = "/tmp/eval_debug.log"
@@ -2415,6 +2282,11 @@ async def _finalize_upload(upload_id: str, upload_data: dict):
             "uploaded_at": str(int(now())),
             "load_est_s": "30"
         })
+        # Clear transient failure flags (e.g., prior download failure) now that the model is present on disk
+        try:
+            await redis.delete(f"model_failure:{model_name}")
+        except Exception:
+            pass
         
         log.info("model_uploaded", model=model_name, size_gb=size/(1024**3))
         

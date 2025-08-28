@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from enum import Enum
+from model_utils import detect_is_base_model
 import structlog
 from fastapi import APIRouter, HTTPException, Depends, Request
 
@@ -290,38 +291,14 @@ class EvalManager:
             self.active_evals.pop(job_id, None)
     
     def _check_is_base_model(self, model: str) -> bool:
-        """
-        Check if a model is a base model by looking for chat_template in tokenizer_config.json.
-        """
-        # Convert model ID to HuggingFace cache path format
-        model_path_pattern = model.replace("/", "--")
-        cache_dir = Path("/host_hf_cache/hub")
-        
-        # Look for the model directory
-        model_dirs = list(cache_dir.glob(f"models--{model_path_pattern}"))
-        if not model_dirs:
-            logger.warning(f"Model directory not found for {model}")
-            return False
-        
-        # Check snapshots for tokenizer_config.json
-        snapshots_dir = model_dirs[0] / "snapshots"
-        if snapshots_dir.exists():
-            for snapshot in snapshots_dir.iterdir():
-                tokenizer_config = snapshot / "tokenizer_config.json"
-                if tokenizer_config.exists():
-                    try:
-                        with open(tokenizer_config) as f:
-                            config = json.load(f)
-                            # If chat_template is None or missing, it's a base model
-                            has_chat_template = config.get("chat_template") is not None
-                            logger.info(f"Model {model} has_chat_template: {has_chat_template}")
-                            return not has_chat_template
-                    except Exception as e:
-                        logger.warning(f"Error reading tokenizer config: {e}")
-        
-        # Default to assuming it's an instruction model
-        logger.info(f"Could not determine if {model} is base model, assuming instruction model")
-        return False
+        """Detect base vs instruction by calling the shared detector."""
+        try:
+            is_base = detect_is_base_model(model)
+            logger.info(f"Model {model} is_base: {is_base}")
+            return is_base
+        except Exception as e:
+            logger.warning(f"Detection error for {model}: {e}; defaulting to base")
+            return True
     
     async def _submit_requests(self, job_id: str, model: str, user_token: str) -> Optional[Dict]:
         """
