@@ -3,7 +3,7 @@ import os, time, uuid, json, asyncio, subprocess, socket, collections
 import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from fastapi import FastAPI, HTTPException, Response, Depends
+from fastapi import FastAPI, HTTPException, Response, Depends, APIRouter
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import redis.asyncio as aioredis
@@ -95,10 +95,22 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
     
     return True
 
+# -------- Routers --------
+# v1: OpenAI-compatible and batch APIs (auth enforced via dependency)
+v1_router = APIRouter(prefix="/v1", dependencies=[Depends(verify_api_key)])
+
+# uploads: TUS protocol endpoints
+upload_router = APIRouter()
+
 @app.get("/healthz")
 async def healthz():
     """Simple liveness endpoint (no auth, fast path)."""
     return {"status": "ok"}
+
+# Mount routers
+app.include_router(v1_router)
+app.include_router(upload_router)
+app.include_router(eval_router)  # /eval endpoints
 
 class CompletionRequest(BaseModel):
     model: str
@@ -799,7 +811,6 @@ async def startup():
     
     # Initialize eval system
     app.state.eval_manager = EvalManager(redis, None)  # batch_manager=None for now
-    app.include_router(eval_router)  # Mount at /eval
     
     # Check if runtime container is already running
     if is_runtime_ready():
@@ -922,7 +933,7 @@ async def shutdown():
         app.state.planner_task.cancel()
         await asyncio.sleep(0.1)
 
-@app.get("/v1/models")
+@v1_router.get("/models")
 async def list_models(auth: bool = Depends(verify_api_key)):
     """OpenAI-compatible models endpoint - returns only the realtime model"""
     return {
@@ -955,7 +966,7 @@ async def metrics(auth: bool = Depends(verify_api_key)):
     
     return Response(generate_latest(), media_type="text/plain")
 
-@app.post("/v1/completions")
+@v1_router.post("/completions")
 async def completions(req: CompletionRequest, response: Response, auth: bool = Depends(verify_api_key)):
     """OpenAI-compatible completions endpoint"""
     # Update realtime arrival tracking for EWMA + hot TTL
@@ -997,7 +1008,7 @@ async def completions(req: CompletionRequest, response: Response, auth: bool = D
     
     return {"error": "Model is loading, please retry", "type": "model_cold_start", "retry_after": 30}
 
-@app.post("/v1/chat/completions")
+@v1_router.post("/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, response: Response, auth: bool = Depends(verify_api_key)):
     """OpenAI-compatible chat completions endpoint"""
     # Update realtime arrival tracking for EWMA + hot TTL
@@ -1038,7 +1049,7 @@ async def chat_completions(req: ChatCompletionRequest, response: Response, auth:
     
     return {"error": "Model is loading, please retry", "type": "model_cold_start", "retry_after": 30}
 
-@app.post("/v1/batch/completions")
+@v1_router.post("/batch/completions")
 async def batch_completions(req: BatchCompletionRequest, response: Response, auth: bool = Depends(verify_api_key)):
     """Submit a batch completion request"""
     # Generate completion ID
@@ -1075,7 +1086,7 @@ async def batch_completions(req: BatchCompletionRequest, response: Response, aut
         "status_url": f"/v1/batch/completions/{completion_id}"
     }
 
-@app.get("/v1/batch/completions/{completion_id}")
+@v1_router.get("/batch/completions/{completion_id}")
 async def get_batch_completion(completion_id: str, auth: bool = Depends(verify_api_key)):
     """Get status/result of a batch completion"""
     jobkey = JOB_HASH_PREFIX + completion_id
@@ -1111,7 +1122,7 @@ async def get_batch_completion(completion_id: str, auth: bool = Depends(verify_a
     
     return {"id": completion_id, "status": status}
 
-@app.post("/v1/batch/chat/completions")
+@v1_router.post("/batch/chat/completions")
 async def batch_chat_completions(req: BatchChatCompletionRequest, response: Response, auth: bool = Depends(verify_api_key)):
     """Submit a batch chat completion request"""
     # Generate completion ID
@@ -1148,7 +1159,7 @@ async def batch_chat_completions(req: BatchChatCompletionRequest, response: Resp
         "status_url": f"/v1/batch/chat/completions/{completion_id}"
     }
 
-@app.get("/v1/batch/chat/completions/{completion_id}")
+@v1_router.get("/batch/chat/completions/{completion_id}")
 async def get_batch_chat_completion(completion_id: str, auth: bool = Depends(verify_api_key)):
     """Get status/result of a batch chat completion"""
     jobkey = JOB_HASH_PREFIX + completion_id
@@ -1184,7 +1195,7 @@ async def get_batch_chat_completion(completion_id: str, auth: bool = Depends(ver
     return {"id": completion_id, "status": status}
 
 
-@app.post("/v1/jobs")
+@v1_router.post("/jobs")
 async def submit_job(j: JobSubmit):
     job_id = str(uuid.uuid4())
     submit_ts = now()
@@ -1202,7 +1213,7 @@ async def submit_job(j: JobSubmit):
     await redis.zadd(BATCH_ZSET, {job_id: submit_ts})
     return {"job_id": job_id}
 
-@app.get("/v1/jobs/{job_id}")
+@v1_router.get("/jobs/{job_id}")
 async def get_job(job_id: str):
     jobkey = JOB_HASH_PREFIX + job_id
     data = await redis.hgetall(jobkey)
@@ -1607,7 +1618,7 @@ UPLOAD_TEMP_DIR = "/tmp/model_uploads"
 # Ensure temp dir exists
 Path(UPLOAD_TEMP_DIR).mkdir(parents=True, exist_ok=True)
 
-@app.options("/upload")
+@upload_router.options("/upload")
 async def tus_options():
     """TUS discovery endpoint"""
     return Response(
@@ -1619,7 +1630,7 @@ async def tus_options():
         }
     )
 
-@app.post("/upload")
+@upload_router.post("/upload")
 async def tus_create(
     request: Request,
     auth: bool = Depends(verify_api_key),
@@ -1685,7 +1696,7 @@ async def tus_create(
         }
     )
 
-@app.head("/upload/{upload_id}")
+@upload_router.head("/upload/{upload_id}")
 async def tus_head(
     upload_id: str,
     auth: bool = Depends(verify_api_key),
@@ -1705,7 +1716,7 @@ async def tus_head(
         }
     )
 
-@app.patch("/upload/{upload_id}")
+@upload_router.patch("/upload/{upload_id}")
 async def tus_patch(
     upload_id: str,
     request: Request,
@@ -1755,6 +1766,16 @@ async def _finalize_upload(upload_id: str, upload_data: dict):
     model_name = upload_data["model_name"]
     
     try:
+        # Validate uploaded size matches expectation
+        try:
+            expected_size = int(upload_data.get("size", "0"))
+            actual_size = os.path.getsize(temp_path)
+            if actual_size != expected_size:
+                raise ValueError(f"Uploaded size mismatch: expected={expected_size} actual={actual_size}")
+        except Exception as e:
+            # Size mismatch or missing; fail fast
+            raise
+
         # Target directory in HF cache format
         model_dir = f"models--{model_name.replace('/', '--')}"
         target_path = os.path.join(HOST_HF_CACHE, "hub", model_dir, "snapshots", "main")
@@ -1766,32 +1787,74 @@ async def _finalize_upload(upload_id: str, upload_data: dict):
         
         log.info("extracting_model", model=model_name, path=target_path)
         
-        # Decompress and extract
+        # Helpers for safe extraction
+        def _strip_leading_dir(name: str) -> str:
+            name = name.lstrip("./")
+            parts = name.split("/", 1)
+            return parts[1] if len(parts) > 1 else parts[0]
+
+        def _safe_join(base: str, *paths: str) -> str:
+            candidate = os.path.normpath(os.path.join(base, *paths))
+            # Ensure within base
+            if os.path.commonpath([base, candidate]) != os.path.abspath(base):
+                raise ValueError("Path traversal detected during extraction")
+            return candidate
+
+        # Decompress and safely extract
         dctx = zstd.ZstdDecompressor()
         with open(temp_path, 'rb') as compressed:
             with dctx.stream_reader(compressed) as reader:
                 with tarfile.open(fileobj=reader, mode='r|') as tar:
                     for member in tar:
-                        # Security check
-                        if os.path.isabs(member.name) or ".." in member.name:
+                        # Normalize and sanitize path
+                        name = _strip_leading_dir(member.name)
+                        if not name:
                             continue
-                        
-                        # Strip leading directory if present
-                        parts = member.name.split('/', 1)
-                        if len(parts) > 1:
-                            member.name = parts[1]
-                        
-                        tar.extract(member, target_path)
+                        if os.path.isabs(name) or ".." in name.split("/"):
+                            continue
+
+                        # Skip symlinks, hardlinks, devices, and fifos
+                        if member.issym() or member.islnk() or member.ischr() or member.isblk() or member.isfifo():
+                            continue
+
+                        dest_path = _safe_join(target_path, name)
+
+                        if member.isdir():
+                            os.makedirs(dest_path, exist_ok=True)
+                            continue
+                        if member.isreg():
+                            # Ensure directory exists
+                            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                            src = tar.extractfile(member)
+                            if src is None:
+                                continue
+                            with open(dest_path, 'wb') as out:
+                                shutil.copyfileobj(src, out, length=1024 * 1024)
+                            # Set conservative file perms
+                            try:
+                                os.chmod(dest_path, 0o644)
+                            except Exception:
+                                pass
+                            continue
+                        # Ignore any other types
+                        continue
         
         # Validate model files exist
-        if not os.path.exists(os.path.join(target_path, "config.json")):
-            raise ValueError("Missing config.json")
+        # Search recursively for config.json (sometimes not at top-level)
+        has_config = False
+        for root, _, files in os.walk(target_path):
+            if "config.json" in files:
+                has_config = True
+                break
+        if not has_config:
+            raise ValueError("Missing config.json in extracted model directory")
         
         # Check for model weights
-        has_weights = any(
-            f.endswith(('.safetensors', '.bin', '.gguf'))
-            for f in os.listdir(target_path)
-        )
+        has_weights = False
+        for root, _, files in os.walk(target_path):
+            if any(f.endswith((".safetensors", ".bin", ".gguf")) for f in files):
+                has_weights = True
+                break
         if not has_weights:
             raise ValueError("No model weights found")
         
@@ -1802,10 +1865,14 @@ async def _finalize_upload(upload_id: str, upload_data: dict):
         })
         
         # Store model metadata
-        size = sum(
-            os.path.getsize(os.path.join(target_path, f))
-            for f in os.listdir(target_path)
-        )
+        size = 0
+        for root, _, files in os.walk(target_path):
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    size += os.path.getsize(fp)
+                except Exception:
+                    pass
         await redis.hset(f"{MODEL_META_PREFIX}{model_name}", mapping={
             "type": "uploaded",
             "size_gb": str(size / (1024**3)),
