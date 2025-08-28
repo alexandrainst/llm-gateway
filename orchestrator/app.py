@@ -91,6 +91,11 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
     
     return True
 
+@app.get("/healthz")
+async def healthz():
+    """Simple liveness endpoint (no auth, fast path)."""
+    return {"status": "ok"}
+
 class CompletionRequest(BaseModel):
     model: str
     prompt: str
