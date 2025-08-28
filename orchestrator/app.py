@@ -19,7 +19,10 @@ log = structlog.get_logger()
 # Config from env
 API_KEY = os.getenv("API_KEY", None)  # Optional API key for auth
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+# Path INSIDE orchestrator container where host HF cache is mounted
 HOST_HF_CACHE = os.getenv("HOST_HF_CACHE", "/host_hf_cache")
+# Optional: explicit host path for HF cache (as seen by Docker daemon)
+HOST_HF_CACHE_HOST = os.getenv("HOST_HF_CACHE_HOST", None)
 RUNTIME_TYPE = os.getenv("RUNTIME_TYPE", "sglang")  # "sglang" or "vllm"
 RUNTIME_IMAGE = os.getenv("RUNTIME_IMAGE", "lmsysorg/sglang:b200-cu129" if RUNTIME_TYPE == "sglang" else "vllm/vllm-openai:latest")
 RUNTIME_ARGS = os.getenv("RUNTIME_ARGS", "--tp 2 --cuda-graph-max-bs 16" if RUNTIME_TYPE == "sglang" else "--tensor-parallel-size 2")
@@ -292,10 +295,32 @@ def start_runtime_container_sync(model_id, extra_args=None):
     # device request for GPUs
     dev_req = DeviceRequest(count=-1, capabilities=[["gpu"]])
 
+    # Determine host path for HF cache mount so runtime container can reuse it
+    def _detect_host_hf_cache() -> str:
+        # 1) Honor explicit override if provided
+        if HOST_HF_CACHE_HOST:
+            return HOST_HF_CACHE_HOST
+        # 2) Inspect this orchestrator container's mounts to find source for /host_hf_cache
+        try:
+            self_ctr = docker_client.containers.get("orchestrator")
+            mounts = self_ctr.attrs.get("Mounts", [])
+            for m in mounts:
+                # Docker SDK uses 'Destination' for target path in container
+                if m.get("Destination") == HOST_HF_CACHE:
+                    src = m.get("Source")
+                    if src:
+                        return src
+        except Exception as e:
+            log.warning("hf_cache_host_detect_failed", error=str(e))
+        # 3) Fallback to a common default
+        return "/home/alex-admin/.cache/huggingface"
+
+    host_hf_cache_path = _detect_host_hf_cache()
+    log.info("using_host_hf_cache", host_path=host_hf_cache_path, container_path="/root/.cache/huggingface")
+
     volumes = {
-        # map the host HF cache into the runtime container so it reuses cached downloads
-        # Use the actual host path, not the orchestrator's container mount path
-        "/home/alex-admin/.cache/huggingface": {"bind": "/root/.cache/huggingface", "mode": "rw"}
+        # Map host HF cache into runtime container under its default HF location
+        host_hf_cache_path: {"bind": "/root/.cache/huggingface", "mode": "rw"}
     }
 
     # create container - join the same network as orchestrator
