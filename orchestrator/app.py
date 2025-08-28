@@ -149,9 +149,23 @@ class BatchChatCompletionRequest(BaseModel):
 
 # ---------- redis connect ----------
 async def redis_connect():
+    """Connect to Redis with retries to tolerate startup ordering."""
     global redis
-    redis = aioredis.from_url(REDIS_URL, decode_responses=True)
-    await redis.ping()
+    attempts = int(os.getenv("REDIS_CONNECT_ATTEMPTS", "60"))
+    delay_s = float(os.getenv("REDIS_CONNECT_BACKOFF_S", "0.5"))
+    last_err = None
+    for i in range(1, attempts + 1):
+        try:
+            redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+            await redis.ping()
+            log.info("redis_connected", url=REDIS_URL, attempt=i)
+            return
+        except Exception as e:
+            last_err = e
+            log.warning("redis_connect_retry", attempt=i, error=str(e))
+            await asyncio.sleep(delay_s)
+    # If we get here, fail startup; Compose will restart based on policy
+    raise RuntimeError(f"Unable to connect to Redis after {attempts} attempts: {last_err}")
 
 # ---------- utilities ----------
 def now():

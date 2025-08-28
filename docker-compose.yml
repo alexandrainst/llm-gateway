@@ -3,6 +3,13 @@ services:
     image: redis:8.2
     volumes:
       - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
 
   orchestrator:
     build: ./orchestrator
@@ -47,8 +54,15 @@ services:
       - ./EuroEval:/home/alex-admin/llm-gateway/EuroEval:ro  # Mount modified EuroEval package
       - ./data:/data:rw  # Mount data directory for eval results
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request,sys; sys.exit(0) if urllib.request.urlopen(\"http://localhost:8000/healthz\").status==200 else sys.exit(1)' "]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     # Add --reload flag for auto-reload on code changes
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info", "--reload"]
 
