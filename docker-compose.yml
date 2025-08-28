@@ -14,11 +14,16 @@ services:
       API_KEY: ${API_KEY:-changeme}
       # HuggingFace token for downloading gated models
       HF_TOKEN: ${HF_TOKEN}
-      # REQUIRED: set this to your host huggingface cache absolute path when launching docker compose
-      HOST_HF_CACHE: ${HOST_HF_CACHE:-/home/alex-admin/.cache/huggingface}
+      # Note: HOST_HF_CACHE is not set here - the code uses /host_hf_cache by default
+      # Runtime type: "sglang" or "vllm"
+      RUNTIME_TYPE: ${RUNTIME_TYPE:-sglang}
       # Runtime image to launch (override as needed)
+      # For sglang: lmsysorg/sglang:b200-cu129
+      # For vLLM: vllm/vllm-openai:latest
       RUNTIME_IMAGE: ${RUNTIME_IMAGE:-lmsysorg/sglang:b200-cu129}
-      # Extra args appended to sglang.launch_server (edit if you want)
+      # Extra args for the runtime
+      # sglang example: --tp 2 --cuda-graph-max-bs 16
+      # vLLM example: --tensor-parallel-size 2 --max-model-len 8192
       RUNTIME_ARGS: ${RUNTIME_ARGS:---tp 2 --cuda-graph-max-bs 16}
       RUNTIME_PORT: ${RUNTIME_PORT:-30000}
       REALTIME_MODEL: ${REALTIME_MODEL:-synquid/gemma-3-27b-it-FP8}
@@ -27,6 +32,9 @@ services:
       P_MAX: ${P_MAX:-0.3}
       TOKENS_B: ${TOKENS_B:-2}
       TOKENS_REFILL_PER_SEC: ${TOKENS_REFILL_PER_SEC:-0.000555}
+      # Disable progress bars for huggingface_hub downloads
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      TQDM_DISABLE: "1"
     ports:
       - "8000:8000"  # Adjust port as needed for your orchestrator
     # bind the docker socket so orchestrator can start/stop runtime containers
@@ -34,6 +42,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${HOST_HF_CACHE:-/home/alex-admin/.cache/huggingface}:/host_hf_cache:rw
       - ./orchestrator/app.py:/app/app.py:ro  # Mount app.py for hot reload
+      - ./orchestrator/eval_manager.py:/app/eval_manager.py:ro  # Mount eval_manager.py
+      - ./eval-repo:/home/alex-admin/llm-gateway/eval-repo:rw  # Mount eval repo for running evals (rw for venv creation)
+      - ./EuroEval:/home/alex-admin/llm-gateway/EuroEval:ro  # Mount modified EuroEval package
+      - ./data:/data:rw  # Mount data directory for eval results
     depends_on:
       - redis
     restart: unless-stopped

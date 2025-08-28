@@ -1,5 +1,5 @@
 # orchestrator/app.py
-import os, time, uuid, json, asyncio, math, subprocess, socket
+import os, time, uuid, json, asyncio, subprocess, socket
 import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -12,6 +12,7 @@ import docker
 from docker.types import DeviceRequest
 import structlog
 from prometheus_client import Counter, Histogram, Gauge, generate_latest
+from eval_manager import EvalManager, router as eval_router
 
 log = structlog.get_logger()
 
@@ -19,10 +20,11 @@ log = structlog.get_logger()
 API_KEY = os.getenv("API_KEY", None)  # Optional API key for auth
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 HOST_HF_CACHE = os.getenv("HOST_HF_CACHE", "/host_hf_cache")
-RUNTIME_IMAGE = os.getenv("RUNTIME_IMAGE", "lmsysorg/sglang:b200-cu129")
-RUNTIME_ARGS = os.getenv("RUNTIME_ARGS", "--tp 2 --cuda-graph-max-bs 16")
+RUNTIME_TYPE = os.getenv("RUNTIME_TYPE", "sglang")  # "sglang" or "vllm"
+RUNTIME_IMAGE = os.getenv("RUNTIME_IMAGE", "lmsysorg/sglang:b200-cu129" if RUNTIME_TYPE == "sglang" else "vllm/vllm-openai:latest")
+RUNTIME_ARGS = os.getenv("RUNTIME_ARGS", "--tp 2 --cuda-graph-max-bs 16" if RUNTIME_TYPE == "sglang" else "--tensor-parallel-size 2")
 RUNTIME_PORT = int(os.getenv("RUNTIME_PORT", "30000"))
-RUNTIME_API_PATH = os.getenv("RUNTIME_API_PATH", "/v1/completions")  # sglang completions endpoint
+RUNTIME_API_PATH = os.getenv("RUNTIME_API_PATH", "/v1/completions")  # Both support OpenAI API
 REALTIME_MODEL = os.getenv("REALTIME_MODEL", "synquid/gemma-3-27b-it-FP8")
 MIN_HOT_TTL_S = int(os.getenv("MIN_HOT_TTL_S", "600"))
 L_MAX_S = int(os.getenv("L_MAX_S", "600"))
@@ -149,6 +151,49 @@ async def redis_connect():
 def now():
     return time.time()
 
+async def cleanup_stuck_jobs():
+    """Clean up any jobs stuck in 'running' state from previous orchestrator run."""
+    cleaned_count = 0
+    
+    # Clean up stuck batch jobs
+    cursor = 0
+    while True:
+        cursor, keys = await redis.scan(cursor, match="batch_job:*", count=100)
+        for key in keys:
+            job_data = await redis.hgetall(key)
+            if job_data.get("status") == "running":
+                # Mark as error - the orchestrator restarted while it was running
+                await redis.hset(key, mapping={
+                    "status": "error",
+                    "error": "Orchestrator restarted",
+                    "finished_ts": str(now())
+                })
+                cleaned_count += 1
+                log.info(f"Cleaned up stuck batch job: {key.decode() if isinstance(key, bytes) else key}")
+        if cursor == 0:
+            break
+    
+    # Clean up stuck eval jobs
+    cursor = 0
+    while True:
+        cursor, keys = await redis.scan(cursor, match="eval_job:*", count=100)
+        for key in keys:
+            try:
+                eval_data = json.loads(await redis.get(key))
+                if eval_data.get("status") == "running":
+                    eval_data["status"] = "failed"
+                    eval_data["error"] = "Orchestrator restarted during evaluation"
+                    await redis.set(key, json.dumps(eval_data))
+                    cleaned_count += 1
+                    log.info(f"Cleaned up stuck eval job: {key.decode() if isinstance(key, bytes) else key}")
+            except Exception as e:
+                log.error(f"Error cleaning eval job {key}: {e}")
+        if cursor == 0:
+            break
+    
+    if cleaned_count > 0:
+        log.info(f"Cleaned up {cleaned_count} stuck jobs from previous run")
+
 def ewma_update_interarrival(delta_t):
     if delta_t <= 0:
         return
@@ -178,23 +223,57 @@ def start_runtime_container_sync(model_id, extra_args=None):
             pass
     except docker.errors.NotFound:
         pass
+    
+    # Check if this is an uploaded model and use local path if so
+    # Use a synchronous Redis client for this blocking function
+    import redis as sync_redis
+    model_path = model_id
+    try:
+        sync_redis_client = sync_redis.from_url(REDIS_URL, decode_responses=True)
+        model_meta = sync_redis_client.hgetall(f"{MODEL_META_PREFIX}{model_id}")
+        sync_redis_client.close()
+        
+        if model_meta and model_meta.get("type") == "uploaded":
+            # For uploaded models, use the local path in the container
+            model_dir = f"models--{model_id.replace('/', '--')}"
+            model_path = f"/root/.cache/huggingface/hub/{model_dir}/snapshots/main"
+            log.info("using_local_path_for_uploaded_model", model=model_id, path=model_path)
+    except Exception as e:
+        log.error("error_checking_model_type", model=model_id, error=str(e))
 
-    cmd = [
-        "python3", "-m", "sglang.launch_server",
-        "--model", model_id
-    ]
+    # Build command based on runtime type
+    if RUNTIME_TYPE == "vllm":
+        # For vLLM docker images, the entrypoint is already set, just pass args
+        cmd = [
+            "--model", model_path,
+            "--host", "0.0.0.0",
+            "--port", str(RUNTIME_PORT),  # Explicitly set port
+            "--served-model-name", model_id  # Use original model ID for API
+        ]
+    else:  # sglang
+        cmd = [
+            "python3", "-m", "sglang.launch_server",
+            "--model", model_path,
+            "--host", "0.0.0.0",
+            "--port", str(RUNTIME_PORT)  # Explicitly set port
+        ]
+    
+    # Add extra args or default args
     if extra_args:
         cmd += extra_args.split()
     else:
         cmd += RUNTIME_ARGS.split()
-    cmd += ["--host", "0.0.0.0", "--port", str(RUNTIME_PORT)]
+    
+    # Log the command for debugging
+    log.info("runtime_command", runtime_type=RUNTIME_TYPE, cmd=cmd, model_path=model_path)
 
     # device request for GPUs
     dev_req = DeviceRequest(count=-1, capabilities=[["gpu"]])
 
     volumes = {
         # map the host HF cache into the runtime container so it reuses cached downloads
-        HOST_HF_CACHE: {"bind": "/root/.cache/huggingface", "mode": "rw"}
+        # Use the actual host path, not the orchestrator's container mount path
+        "/home/alex-admin/.cache/huggingface": {"bind": "/root/.cache/huggingface", "mode": "rw"}
     }
 
     # create container - join the same network as orchestrator
@@ -209,20 +288,36 @@ def start_runtime_container_sync(model_id, extra_args=None):
     except Exception as e:
         log.warning("could_not_determine_orchestrator_network", error=str(e), fallback_network=network_name)
     
+    # Build container kwargs
+    container_kwargs = {
+        "detach": True,
+        "name": CONTAINER_NAME,
+        "device_requests": [dev_req],
+        "volumes": volumes,
+        "network": network_name,  # Use same network as orchestrator
+        "shm_size": "32g",
+        "ipc_mode": "host",
+        "labels": {"gpu-owner": "orchestrator"},
+        "stderr": True, 
+        "stdout": True,
+        "restart_policy": {"Name": "no"},
+        "environment": {
+            "HF_HUB_DISABLE_PROGRESS_BARS": "1",  # Disable progress bars in non-TTY environment
+            "TQDM_DISABLE": "1"  # Also disable tqdm globally
+        }
+    }
+    
+    # For vLLM, override entrypoint to ensure our args are used correctly
+    if RUNTIME_TYPE == "vllm":
+        container_kwargs["entrypoint"] = "python3 -m vllm.entrypoints.openai.api_server"
+        container_kwargs["command"] = cmd
+    else:
+        container_kwargs["command"] = cmd
+    
     try:
         container = docker_client.containers.run(
             RUNTIME_IMAGE,
-            command=cmd,
-            detach=True,
-            name=CONTAINER_NAME,
-            device_requests=[dev_req],
-            volumes=volumes,
-            network=network_name,  # Use same network as orchestrator
-            shm_size="32g",
-            ipc_mode="host",
-            labels={"gpu-owner": "orchestrator"},
-            stderr=True, stdout=True,
-            restart_policy={"Name": "no"}
+            **container_kwargs
         )
         return container
     except Exception as e:
@@ -252,6 +347,79 @@ def is_runtime_ready():
 def get_runtime_host():
     """Get the hostname for the runtime container - use container name in compose network"""
     return CONTAINER_NAME
+
+async def send_warmup_request():
+    """Send a warmup request to the runtime to prime it"""
+    try:
+        runtime_host = get_runtime_host()
+        runtime_url = f"http://{runtime_host}:{RUNTIME_PORT}"
+        
+        # Get the actual model name from the runtime
+        async with httpx.AsyncClient(timeout=30) as client:
+            # First get the model name from the runtime
+            models_response = await client.get(f"{runtime_url}/v1/models")
+            if models_response.status_code == 200:
+                models_data = models_response.json()
+                if models_data.get("data"):
+                    model_name = models_data["data"][0]["id"]
+                else:
+                    model_name = state.get("current_model", "model")
+            else:
+                model_name = state.get("current_model", "model")
+            
+            # Check if this is a base model by looking for chat_template in tokenizer config
+            # (Same logic as eval_manager uses)
+            is_base_model = False
+            current_model = state.get("current_model") or state.get("loading_model")
+            if current_model:
+                # Check if it's an uploaded model first
+                import redis as sync_redis
+                try:
+                    sync_redis_client = sync_redis.from_url(REDIS_URL, decode_responses=True)
+                    model_meta = sync_redis_client.hgetall(f"{MODEL_META_PREFIX}{current_model}")
+                    sync_redis_client.close()
+                    
+                    if model_meta and model_meta.get("type") == "uploaded":
+                        # For uploaded models, check tokenizer_config.json
+                        model_dir = f"/host_hf_cache/hub/models--{current_model.replace('/', '--')}"
+                        tokenizer_config_path = f"{model_dir}/snapshots/main/tokenizer_config.json"
+                        if os.path.exists(tokenizer_config_path):
+                            with open(tokenizer_config_path) as f:
+                                config = json.load(f)
+                                is_base_model = config.get("chat_template") is None
+                except Exception:
+                    pass
+            
+            # Send appropriate warmup based on model type
+            if is_base_model:
+                # Base model - use completion endpoint
+                warmup_data = {
+                    "model": model_name,
+                    "prompt": "Hello",
+                    "max_tokens": 1,
+                    "temperature": 0
+                }
+                endpoint = "/v1/completions"
+            else:
+                # Instruction model - use chat endpoint
+                warmup_data = {
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 1,
+                    "temperature": 0
+                }
+                endpoint = "/v1/chat/completions"
+            
+            response = await client.post(
+                f"{runtime_url}{endpoint}",
+                json=warmup_data
+            )
+            if response.status_code == 200:
+                log.info("warmup_request_sent", model=model_name, is_base=is_base_model)
+            else:
+                log.warning("warmup_request_failed", status=response.status_code, model=model_name, is_base=is_base_model)
+    except Exception as e:
+        log.warning("warmup_request_error", error=str(e))
 
 async def wait_for_runtime_ready(timeout=600):
     runtime_host = get_runtime_host()
@@ -307,6 +475,8 @@ async def wait_for_runtime_ready(timeout=600):
                     r = await client.get(f"http://{runtime_host}:{RUNTIME_PORT}/v1/models", timeout=5.0)
                     if r.status_code == 200:
                         log.info("runtime_ready", host=runtime_host)
+                        # Send warmup request to prime the runtime
+                        await send_warmup_request()
                         return True
             except Exception as e:
                 log.debug("runtime_not_responding_yet", host=runtime_host, error=str(e))
@@ -352,7 +522,7 @@ def prefetch_pagecache_blocking(model_id):
         log.warning("model_not_found_for_prefetch", model_id=model_id, path=model_dir)
         return
     
-    log.info("prefetching_model_to_cache", model_id=model_id, path=model_dir)
+    log.debug("prefetching_model_to_cache", model_id=model_id, path=model_dir)
     
     # Try vmtouch first (most efficient)
     from shutil import which
@@ -383,7 +553,7 @@ def prefetch_pagecache_blocking(model_id):
                 except Exception:
                     pass
     
-    log.info("prefetch_complete", model_id=model_id, bytes_read=total_size)
+    log.debug("prefetch_complete", model_id=model_id, bytes_read=total_size)
 
 async def prefetch_pagecache_async(model_id):
     loop = asyncio.get_running_loop()
@@ -503,7 +673,7 @@ async def analyze_queue_storage_needs() -> Dict[str, Dict]:
         if not h:
             continue
         
-        model_id = h.get("model_id")
+        model_id = h.get("model")  # Batch jobs store it as "model"
         if not model_id:
             continue
         
@@ -548,7 +718,7 @@ async def proactive_storage_management():
     # Prefetch high-priority models that might be used soon
     for model_id, info in models_by_importance[:2]:  # Top 2 models
         if info["on_disk"] and not info["is_current"] and not info["in_page_cache"]:
-            log.info("proactive_prefetch", model_id=model_id)
+            log.debug("proactive_prefetch", model_id=model_id)  # Changed to debug level
             asyncio.create_task(prefetch_pagecache_async(model_id))
             break  # Prefetch one at a time
 
@@ -557,7 +727,14 @@ async def proactive_storage_management():
 async def startup():
     await redis_connect()
     
-    # Check if runtime container is already running and set current model
+    # Clean up any stuck jobs from previous run
+    await cleanup_stuck_jobs()
+    
+    # Initialize eval system
+    app.state.eval_manager = EvalManager(redis, None)  # batch_manager=None for now
+    app.include_router(eval_router)  # Mount at /eval
+    
+    # Check if runtime container is already running
     if is_runtime_ready():
         try:
             runtime_host = get_runtime_host()
@@ -569,12 +746,44 @@ async def startup():
                         model_id = models["data"][0]["id"]
                         state["current_model"] = model_id
                         log.info("found_existing_runtime", model_id=model_id)
+                        
+                        # Check if we should switch models based on pending work
+                        batch_job_count = await redis.zcard(BATCH_ZSET) if redis else 0
+                        
+                        if batch_job_count == 0 and model_id != REALTIME_MODEL:
+                            # No batch jobs, switch to realtime model
+                            log.info("no_batch_jobs_switching_to_realtime", 
+                                   current=model_id, target=REALTIME_MODEL)
+                            asyncio.create_task(load_realtime_model_async())
+                        elif batch_job_count > 0:
+                            # Have batch jobs - check if current model can handle them
+                            jobs_for_current = 0
+                            all_jobs = await redis.zrange(BATCH_ZSET, 0, -1)
+                            for jid in all_jobs[:100]:  # Sample first 100
+                                job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                                if job_data and job_data.get("model") == model_id:
+                                    jobs_for_current += 1
+                            
+                            if jobs_for_current == 0:
+                                # Current model has no jobs, should switch to one that does
+                                log.info("current_model_has_no_jobs", 
+                                       model=model_id, batch_jobs=batch_job_count)
+                                # Let the batch planner handle switching to the right model
+                            else:
+                                log.info("keeping_current_model", 
+                                       model=model_id, jobs_for_model=jobs_for_current)
         except Exception as e:
             log.warning("could_not_determine_model_from_runtime", error=str(e))
     else:
-        # No runtime running - start realtime model and warm it up
-        log.info("starting_default_realtime_model", model=REALTIME_MODEL)
-        asyncio.create_task(load_realtime_model_async())
+        # No runtime running - check what we need
+        batch_job_count = await redis.zcard(BATCH_ZSET) if redis else 0
+        if batch_job_count == 0:
+            # No batch jobs - start realtime model
+            log.info("starting_default_realtime_model", model=REALTIME_MODEL)
+            asyncio.create_task(load_realtime_model_async())
+        else:
+            # Have batch jobs - let the planner decide which model to load
+            log.info("batch_jobs_pending_planner_will_decide", count=batch_job_count)
     
     app.state.planner_task = asyncio.create_task(batch_planner_loop())
 
@@ -583,7 +792,9 @@ async def load_realtime_model_async():
     try:
         await prefetch_pagecache_async(REALTIME_MODEL)
         await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(REALTIME_MODEL))
-        ok = await wait_for_runtime_ready(timeout=120)
+        # vLLM needs more time to start up
+        startup_timeout = 300 if RUNTIME_TYPE == "vllm" else 120
+        ok = await wait_for_runtime_ready(timeout=startup_timeout)
         if ok:
             state["current_model"] = REALTIME_MODEL
             log.info("realtime_model_loaded_on_startup", model=REALTIME_MODEL)
@@ -993,28 +1204,17 @@ async def batch_planner_loop():
                 await asyncio.sleep(1.0)
                 continue
 
-            # Estimate work time for L calculation
-            total_work = sum(e for (_, _, e) in jobs_by_model[best_model])
-            L = int(min(L_MAX_S, max(5, total_work)))
-            
             # Check if we need to switch models and if we're allowed to
             need_switch = (best_model != current_model)
             
             if need_switch:
                 # Check if we can leave the current model
-                lam = state["lambda_ewma"] or 0.0
-                prob_arrival = 1 - math.exp(-lam * L) if lam > 0 else 0.0
-
                 can_leave_rt = True
                 reasons_blocked = []
                 
                 if state["tokens"] < 1:
                     can_leave_rt = False
                     reasons_blocked.append(f"no_tokens (have {state['tokens']})")
-                    
-                if prob_arrival > P_MAX:
-                    can_leave_rt = False
-                    reasons_blocked.append(f"high_arrival_prob ({prob_arrival:.2f} > {P_MAX})")
                     
                 if current_model == REALTIME_MODEL:
                     time_since_rt = now() - state["last_rt_ts"]
@@ -1039,25 +1239,20 @@ async def batch_planner_loop():
                         score=model_ranking[0][1] if model_ranking else 0,
                         job_count=len(jobs_by_model[best_model]))
 
-            # claim jobs up to L seconds
+            # Claim ALL jobs for the current model (no L-second limit)
             claimed = []
-            remain_L = L
             all_queued = await redis.zrange(BATCH_ZSET, 0, -1)
             for jid in all_queued:
-                if remain_L <= 0:
-                    break
                 h = await redis.hgetall(JOB_HASH_PREFIX + jid)
                 if not h:
                     await redis.zrem(BATCH_ZSET, jid)
                     continue
                 if h.get("model") != best_model:
                     continue
-                est = float(h.get("estimate_s", "5.0"))
                 removed = await redis.zrem(BATCH_ZSET, jid)
                 if removed:
                     await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "running", "started_ts": str(now())})
                     claimed.append(jid)
-                    remain_L -= est
 
             if not claimed:
                 await asyncio.sleep(0.5)
@@ -1084,41 +1279,60 @@ async def batch_planner_loop():
                     await asyncio.sleep(10)
                     continue
             
-            # Only spend token if we're actually going to evict realtime
-            if state.get("current_model") == REALTIME_MODEL:
-                state["tokens"] = max(0.0, state["tokens"] - 1.0)
-                log.info("batch_evicting_realtime", tokens_remaining=state["tokens"])
-            
-            # Prefetch model to page cache before evicting realtime
-            log.info("prefetching_batch_model", model=best_model)
-            await prefetch_pagecache_async(best_model)
-            
-            # Only NOW stop the runtime container
-            log.info("stopping_runtime_for_batch", current_model=state.get("current_model"))
-            await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
-            try:
-                await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(best_model))
-            except Exception as e:
-                # requeue claimed jobs with original submit time
-                for jid in claimed:
-                    job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
-                    original_ts = float(job_data.get("submit_ts", now()))
-                    await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
-                    await redis.zadd(BATCH_ZSET, {jid: original_ts})
-                await asyncio.sleep(1.0)
-                continue
+            # Only restart runtime if we're switching models
+            if best_model != state.get("current_model"):
+                # Only spend token if we're actually going to evict realtime
+                if state.get("current_model") == REALTIME_MODEL:
+                    state["tokens"] = max(0.0, state["tokens"] - 1.0)
+                    log.info("batch_evicting_realtime", tokens_remaining=state["tokens"])
+                
+                # Prefetch model to page cache before evicting realtime
+                log.info("prefetching_batch_model", model=best_model)
+                await prefetch_pagecache_async(best_model)
+                
+                # Only NOW stop the runtime container
+                log.info("stopping_runtime_for_batch", current_model=state.get("current_model"))
+                await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
+                try:
+                    await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(best_model))
+                except Exception as e:
+                    # requeue claimed jobs with original submit time
+                    for jid in claimed:
+                        job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                        original_ts = float(job_data.get("submit_ts", now()))
+                        await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
+                        await redis.zadd(BATCH_ZSET, {jid: original_ts})
+                    await asyncio.sleep(1.0)
+                    continue
 
-            ok = await wait_for_runtime_ready(timeout=900)
-            if not ok:
-                for jid in claimed:
-                    job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
-                    original_ts = float(job_data.get("submit_ts", now()))
-                    await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
-                    await redis.zadd(BATCH_ZSET, {jid: original_ts})
-                await asyncio.sleep(1.0)
-                continue
+                ok = await wait_for_runtime_ready(timeout=900)
+                if not ok:
+                    for jid in claimed:
+                        job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                        original_ts = float(job_data.get("submit_ts", now()))
+                        await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
+                        await redis.zadd(BATCH_ZSET, {jid: original_ts})
+                    await asyncio.sleep(1.0)
+                    continue
 
-            state["current_model"] = best_model
+                state["current_model"] = best_model
+            else:
+                # Already on the right model, just check it's ready
+                ok = await wait_for_runtime_ready(timeout=10)
+                if not ok:
+                    log.warning("runtime_not_responding", model=best_model)
+                    # Force restart
+                    await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
+                    await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(best_model))
+                    ok = await wait_for_runtime_ready(timeout=900)
+                    if not ok:
+                        for jid in claimed:
+                            job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                            original_ts = float(job_data.get("submit_ts", now()))
+                            await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
+                            await redis.zadd(BATCH_ZSET, {jid: original_ts})
+                        await asyncio.sleep(1.0)
+                        continue
 
             # While running jobs, prefetch the next model in background
             if len(model_ranking) > 1:
@@ -1131,56 +1345,82 @@ async def batch_planner_loop():
                     log.info("prefetching_next_model_pagecache", current=best_model, next=next_model)
                     asyncio.create_task(prefetch_pagecache_async(next_model))
 
-            # run claimed jobs, preempt if realtime arrives
-            for jid in claimed:
-                if state.get("preempt"):
-                    # requeue this job and remaining ones with original submit times
-                    job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
-                    original_ts = float(job_data.get("submit_ts", now()))
-                    await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
-                    await redis.zadd(BATCH_ZSET, {jid: original_ts})
-                    for rjid in claimed[claimed.index(jid)+1:]:
-                        rjob_data = await redis.hgetall(JOB_HASH_PREFIX + rjid)
-                        roriginal_ts = float(rjob_data.get("submit_ts", now()))
-                        await redis.hset(JOB_HASH_PREFIX + rjid, mapping={"status": "queued"})
-                        await redis.zadd(BATCH_ZSET, {rjid: roriginal_ts})
-                    break
-
-                jobh = await redis.hgetall(JOB_HASH_PREFIX + jid)
-                if not jobh:
-                    continue
-                
-                # Reconstruct the request based on job type
-                job_type = jobh.get("type", "completion")
-                try:
-                    if job_type == "completion":
-                        # Build completions request
-                        request_data = {
-                            "model": jobh.get("model", best_model),
-                            "prompt": jobh.get("prompt", ""),
-                            "max_tokens": int(jobh.get("max_tokens", 100)),
-                            "temperature": float(jobh.get("temperature", 0.7)),
-                            "top_p": float(jobh.get("top_p", 1.0)),
-                            "n": int(jobh.get("n", 1)),
-                            "stop": json.loads(jobh.get("stop", "null"))
-                        }
-                        res = await runtime_proxy("/v1/completions", request_data)
-                    else:  # chat_completion
-                        # Build chat completions request
-                        request_data = {
-                            "model": jobh.get("model", best_model), 
-                            "messages": json.loads(jobh.get("messages", "[]")),
-                            "max_tokens": int(jobh.get("max_tokens", 100)),
-                            "temperature": float(jobh.get("temperature", 0.7)),
-                            "top_p": float(jobh.get("top_p", 1.0)),
-                            "n": int(jobh.get("n", 1)),
-                            "stop": json.loads(jobh.get("stop", "null"))
-                        }
-                        res = await runtime_proxy("/v1/chat/completions", request_data)
+            # Process claimed jobs concurrently with max concurrency using semaphore
+            MAX_CONCURRENT_BATCH = 200
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_BATCH)
+            
+            async def process_batch_job(jid):
+                """Process a single batch job with semaphore-controlled concurrency"""
+                async with semaphore:
+                    # Check for preemption
+                    if state.get("preempt"):
+                        # Requeue this job
+                        job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                        if job_data:
+                            original_ts = float(job_data.get("submit_ts", now()))
+                            await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
+                            await redis.zadd(BATCH_ZSET, {jid: original_ts})
+                        return
                     
-                    await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "done", "result": json.dumps(res), "finished_ts": str(now())})
-                except Exception as e:
-                    await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "error", "error": str(e), "finished_ts": str(now())})
+                    jobh = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                    if not jobh:
+                        return
+                    
+                    # Reconstruct the request based on job type
+                    job_type = jobh.get("type", "completion")
+                    try:
+                        if job_type == "completion":
+                            # Build completions request
+                            request_data = {
+                                "model": jobh.get("model", best_model),
+                                "prompt": jobh.get("prompt", ""),
+                                "max_tokens": int(jobh.get("max_tokens", 100)),
+                                "temperature": float(jobh.get("temperature", 0.7)),
+                                "top_p": float(jobh.get("top_p", 1.0)),
+                                "n": int(jobh.get("n", 1)),
+                                "stop": json.loads(jobh.get("stop", "null"))
+                            }
+                            res = await runtime_proxy("/v1/completions", request_data)
+                        else:  # chat_completion
+                            # Build chat completions request
+                            request_data = {
+                                "model": jobh.get("model", best_model), 
+                                "messages": json.loads(jobh.get("messages", "[]")),
+                                "max_tokens": int(jobh.get("max_tokens", 100)),
+                                "temperature": float(jobh.get("temperature", 0.7)),
+                                "top_p": float(jobh.get("top_p", 1.0)),
+                                "n": int(jobh.get("n", 1)),
+                                "stop": json.loads(jobh.get("stop", "null"))
+                            }
+                            res = await runtime_proxy("/v1/chat/completions", request_data)
+                        
+                        # Debug logging for eval responses
+                        if jobh.get("eval_name"):
+                            debug_log = "/tmp/eval_debug.log"
+                            with open(debug_log, "a") as f:
+                                f.write(f"\n[{now()}] Job {jid} for eval {jobh.get('eval_name')}\n")
+                                f.write(f"Request max_tokens: {jobh.get('max_tokens', 'not set')}\n")
+                                if "choices" in res and res["choices"]:
+                                    content = res["choices"][0].get("message", {}).get("content", "") if "message" in res["choices"][0] else res["choices"][0].get("text", "")
+                                    f.write(f"Response content length: {len(content)}\n")
+                                    f.write(f"Response content (first 200 chars): {content[:200]!r}\n")
+                                    f.write(f"Finish reason: {res['choices'][0].get('finish_reason', 'unknown')}\n")
+                                else:
+                                    f.write(f"No choices in response: {json.dumps(res)[:500]}\n")
+                        
+                        await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "completed", "result": json.dumps(res), "finished_ts": str(now())})
+                    except Exception as e:
+                        await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "error", "error": str(e), "finished_ts": str(now())})
+            
+            # Start all jobs concurrently - semaphore will limit actual concurrency
+            tasks = [asyncio.create_task(process_batch_job(jid)) for jid in claimed]
+            
+            # Wait for all tasks to complete or preemption
+            try:
+                await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                # If cancelled due to preemption, tasks will handle their own cleanup
+                pass
 
             # After batch work is done, return to realtime model
             log.info("batch_segment_complete", model=best_model, jobs_processed=len(claimed))
@@ -1203,5 +1443,241 @@ async def batch_planner_loop():
         except asyncio.CancelledError:
             break
         except Exception as e:
-            log.error("batch_planner_error", error=str(e))
+            import traceback
+            log.error("batch_planner_error", 
+                     error=str(e),
+                     error_type=type(e).__name__,
+                     traceback=traceback.format_exc())
             await asyncio.sleep(1.0)
+
+# ============ TUS Upload Implementation ============
+import aiofiles
+import tarfile
+import base64
+import zstandard as zstd
+from pathlib import Path
+from fastapi import Request, Header
+
+TUS_VERSION = "1.0.0"
+TUS_MAX_SIZE = 200 * 1024 * 1024 * 1024  # 200GB
+UPLOAD_TEMP_DIR = "/tmp/model_uploads"
+
+# Ensure temp dir exists
+Path(UPLOAD_TEMP_DIR).mkdir(parents=True, exist_ok=True)
+
+@app.options("/upload")
+async def tus_options():
+    """TUS discovery endpoint"""
+    return Response(
+        status_code=204,
+        headers={
+            "Tus-Version": TUS_VERSION,
+            "Tus-Max-Size": str(TUS_MAX_SIZE),
+            "Tus-Extension": "creation"
+        }
+    )
+
+@app.post("/upload")
+async def tus_create(
+    request: Request,
+    auth: bool = Depends(verify_api_key),
+    upload_length: int = Header(None),
+    upload_metadata: str = Header(None),
+    tus_resumable: str = Header(TUS_VERSION)
+):
+    """TUS upload creation endpoint"""
+    if tus_resumable != TUS_VERSION:
+        return Response(
+            status_code=412,
+            headers={"Tus-Version": TUS_VERSION}
+        )
+    
+    if not upload_length:
+        raise HTTPException(status_code=400, detail="Upload-Length required")
+    
+    if upload_length > TUS_MAX_SIZE:
+        raise HTTPException(status_code=413, detail=f"File too large. Max: {TUS_MAX_SIZE}")
+    
+    # Parse metadata (base64 encoded key-value pairs)
+    metadata = {}
+    if upload_metadata:
+        for item in upload_metadata.split(","):
+            if " " in item:
+                key, value_b64 = item.strip().split(" ", 1)
+                try:
+                    metadata[key] = base64.b64decode(value_b64).decode('utf-8')
+                except:
+                    pass
+    
+    model_name = metadata.get("model_name")
+    if not model_name:
+        raise HTTPException(status_code=400, detail="model_name required in metadata")
+    
+    # Validate model name (alphanumeric, hyphens, underscores, one slash)
+    import re
+    if not re.match(r'^[a-zA-Z0-9_-]+(/[a-zA-Z0-9_-]+)?$', model_name):
+        raise HTTPException(status_code=400, detail="Invalid model name format")
+    
+    # Create upload ID and temp file path
+    upload_id = str(uuid.uuid4())
+    temp_path = os.path.join(UPLOAD_TEMP_DIR, f"{upload_id}.tar.zst")
+    
+    # Store upload state in Redis
+    await redis.hset(f"upload:{upload_id}", mapping={
+        "model_name": model_name,
+        "size": str(upload_length),
+        "offset": "0",
+        "temp_path": temp_path,
+        "status": "uploading",
+        "created": str(int(now()))
+    })
+    await redis.expire(f"upload:{upload_id}", 86400)  # 24h TTL
+    
+    log.info("upload_created", upload_id=upload_id, model=model_name, size=upload_length)
+    
+    return Response(
+        status_code=201,
+        headers={
+            "Location": f"/upload/{upload_id}",
+            "Tus-Resumable": TUS_VERSION
+        }
+    )
+
+@app.head("/upload/{upload_id}")
+async def tus_head(
+    upload_id: str,
+    auth: bool = Depends(verify_api_key),
+    tus_resumable: str = Header(TUS_VERSION)
+):
+    """TUS resumption endpoint - returns current offset"""
+    upload_data = await redis.hgetall(f"upload:{upload_id}")
+    if not upload_data:
+        raise HTTPException(status_code=404)
+    
+    return Response(
+        headers={
+            "Upload-Offset": upload_data["offset"],
+            "Upload-Length": upload_data["size"],
+            "Tus-Resumable": TUS_VERSION,
+            "Cache-Control": "no-store"
+        }
+    )
+
+@app.patch("/upload/{upload_id}")
+async def tus_patch(
+    upload_id: str,
+    request: Request,
+    auth: bool = Depends(verify_api_key),
+    upload_offset: int = Header(...),
+    content_type: str = Header(...),
+    tus_resumable: str = Header(TUS_VERSION)
+):
+    """TUS chunk upload endpoint"""
+    if content_type != "application/offset+octet-stream":
+        raise HTTPException(status_code=415)
+    
+    upload_data = await redis.hgetall(f"upload:{upload_id}")
+    if not upload_data:
+        raise HTTPException(status_code=404)
+    
+    # Check offset matches
+    current_offset = int(upload_data["offset"])
+    if upload_offset != current_offset:
+        raise HTTPException(status_code=409, detail="Offset mismatch")
+    
+    # Read and append chunk
+    chunk = await request.body()
+    temp_path = upload_data["temp_path"]
+    
+    async with aiofiles.open(temp_path, "ab") as f:
+        await f.write(chunk)
+    
+    new_offset = current_offset + len(chunk)
+    await redis.hset(f"upload:{upload_id}", "offset", str(new_offset))
+    
+    # Check if complete
+    if new_offset >= int(upload_data["size"]):
+        await _finalize_upload(upload_id, upload_data)
+    
+    return Response(
+        status_code=204,
+        headers={
+            "Upload-Offset": str(new_offset),
+            "Tus-Resumable": TUS_VERSION
+        }
+    )
+
+async def _finalize_upload(upload_id: str, upload_data: dict):
+    """Extract and install uploaded model"""
+    temp_path = upload_data["temp_path"]
+    model_name = upload_data["model_name"]
+    
+    try:
+        # Target directory in HF cache format
+        model_dir = f"models--{model_name.replace('/', '--')}"
+        target_path = os.path.join(HOST_HF_CACHE, "hub", model_dir, "snapshots", "main")
+        
+        # Clean existing if present
+        if os.path.exists(target_path):
+            shutil.rmtree(target_path)
+        os.makedirs(target_path, exist_ok=True)
+        
+        log.info("extracting_model", model=model_name, path=target_path)
+        
+        # Decompress and extract
+        dctx = zstd.ZstdDecompressor()
+        with open(temp_path, 'rb') as compressed:
+            with dctx.stream_reader(compressed) as reader:
+                with tarfile.open(fileobj=reader, mode='r|') as tar:
+                    for member in tar:
+                        # Security check
+                        if os.path.isabs(member.name) or ".." in member.name:
+                            continue
+                        
+                        # Strip leading directory if present
+                        parts = member.name.split('/', 1)
+                        if len(parts) > 1:
+                            member.name = parts[1]
+                        
+                        tar.extract(member, target_path)
+        
+        # Validate model files exist
+        if not os.path.exists(os.path.join(target_path, "config.json")):
+            raise ValueError("Missing config.json")
+        
+        # Check for model weights
+        has_weights = any(
+            f.endswith(('.safetensors', '.bin', '.gguf'))
+            for f in os.listdir(target_path)
+        )
+        if not has_weights:
+            raise ValueError("No model weights found")
+        
+        # Mark complete
+        await redis.hset(f"upload:{upload_id}", mapping={
+            "status": "completed",
+            "completed": str(int(now()))
+        })
+        
+        # Store model metadata
+        size = sum(
+            os.path.getsize(os.path.join(target_path, f))
+            for f in os.listdir(target_path)
+        )
+        await redis.hset(f"{MODEL_META_PREFIX}{model_name}", mapping={
+            "type": "uploaded",
+            "size_gb": str(size / (1024**3)),
+            "uploaded_at": str(int(now())),
+            "load_est_s": "30"
+        })
+        
+        log.info("model_uploaded", model=model_name, size_gb=size/(1024**3))
+        
+    except Exception as e:
+        log.error("upload_failed", model=model_name, error=str(e))
+        await redis.hset(f"upload:{upload_id}", "status", "failed")
+        raise
+    finally:
+        # Cleanup temp file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)

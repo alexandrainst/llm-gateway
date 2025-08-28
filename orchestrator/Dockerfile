@@ -1,6 +1,10 @@
 FROM python:3.12-slim
 WORKDIR /app
-COPY requirements.txt app.py ./
+
+# Install uv for fast venv creation
+RUN pip install uv
+
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 ENV PYTHONUNBUFFERED=1
 # Command is specified in docker-compose.yml for flexibility

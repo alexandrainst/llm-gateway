@@ -1,0 +1,11 @@
+[eval]
+# Core eval configuration
+requires_instruction_model = true
+description = "Danish Instruction Following Evaluation - Tests models' ability to follow specific instructions"
+
+[display]
+title = "IFEval-DA"
+metrics = [
+  { key = "strict_accuracy", label = "Strict" },
+  { key = "loose_accuracy", label = "Loose" }
+]

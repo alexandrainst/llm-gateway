@@ -1,0 +1,7 @@
+[eval]
+# Core eval configuration
+requires_instruction_model = true
+description = "Example evaluation for testing"
+
+[display]
+title = "Example Eval"

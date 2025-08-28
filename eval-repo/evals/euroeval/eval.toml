@@ -1,0 +1,20 @@
+[eval]
+# Core eval configuration
+requires_instruction_model = false  # EuroEval can work with both base and instruction models
+description = "European language benchmarks via modified EuroEval framework"
+
+[euroeval]
+# Datasets to run by default
+datasets = ["angry-tweets", "dansk", "multi-wiki-qa-da", "scala-da", "danske-talemaader", "danish-citizen-tests"]
+
+# Full list of available datasets:
+# Danish: angry-tweets, scandiqa-da, dane, nordjylland-news
+# Norwegian: norec, norne, scandiqa-no
+# Swedish: swerec, scandiqa-sv
+
+# Test configuration
+evaluate_test_split = true  # Use test split instead of validation split
+few_shot = true  # Whether to use few-shot examples (reduces test set size)
+
+[display]
+title = "EuroEval"

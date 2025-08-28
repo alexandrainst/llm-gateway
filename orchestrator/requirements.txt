@@ -7,3 +7,5 @@ python-dotenv
 structlog
 huggingface-hub>=0.20.0
 prometheus-client>=0.19.0
+aiofiles
+zstandard

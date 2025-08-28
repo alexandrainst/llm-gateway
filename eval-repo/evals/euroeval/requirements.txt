@@ -1,0 +1,6 @@
+# Install our modified EuroEval from local path
+-e /home/alex-admin/llm-gateway/EuroEval
+
+# Additional dependencies that might be needed
+structlog
+termcolor

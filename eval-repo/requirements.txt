@@ -1,0 +1,15 @@
+# Dependencies for all evals
+
+# For ifeval-da
+absl-py
+nltk
+transformers  # For tokenizer checks
+
+# Common eval dependencies
+numpy
+pandas
+scikit-learn
+
+# For future evals
+# euroeval  # When we add it
+# lm-eval  # When we add it
