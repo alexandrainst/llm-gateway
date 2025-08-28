@@ -38,6 +38,10 @@ TOKENS_B = float(os.getenv("TOKENS_B", "2"))
 REFILL_PER_SEC = float(os.getenv("TOKENS_REFILL_PER_SEC", "0.000555"))
 MAX_CONCURRENT_BATCH = int(os.getenv("MAX_CONCURRENT_BATCH", "64"))
 
+# Readiness timeouts (seconds)
+DEFAULT_READY_TIMEOUT_S = int(os.getenv("DEFAULT_READY_TIMEOUT_S", "120"))
+VLLM_READY_TIMEOUT_S = int(os.getenv("VLLM_READY_TIMEOUT_S", "900"))
+
 BATCH_ZSET = "z:batchjobs"
 JOB_HASH_PREFIX = "job:"
 MODEL_META_PREFIX = "model:"
@@ -933,7 +937,7 @@ async def load_realtime_model_async():
         t0 = time.time()
         await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(REALTIME_MODEL))
         # vLLM needs more time to start up
-        startup_timeout = 300 if RUNTIME_TYPE == "vllm" else 120
+        startup_timeout = VLLM_READY_TIMEOUT_S if RUNTIME_TYPE == "vllm" else DEFAULT_READY_TIMEOUT_S
         ok = await wait_for_runtime_ready(timeout=startup_timeout)
         if ok:
             state["current_model"] = REALTIME_MODEL
@@ -966,7 +970,8 @@ async def ensure_realtime_model_loading():
             await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
             t0 = time.time()
             await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(REALTIME_MODEL))
-            ok = await wait_for_runtime_ready(timeout=60)
+            load_timeout = VLLM_READY_TIMEOUT_S if RUNTIME_TYPE == "vllm" else DEFAULT_READY_TIMEOUT_S
+            ok = await wait_for_runtime_ready(timeout=load_timeout)
             if ok:
                 prev_model = state.get("current_model")
                 state["current_model"] = REALTIME_MODEL
@@ -1611,26 +1616,20 @@ async def batch_planner_loop():
                 pass
             if not queued:
                 # If there are no batch jobs and we're not on the realtime model, switch back proactively
-                if state.get("current_model") and state.get("current_model") != REALTIME_MODEL:
-                    try:
-                        log.info("no_batch_jobs_switching_to_realtime_proactive",
-                                 from_model=state.get("current_model"), to_model=REALTIME_MODEL)
-                        await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
-                        t0 = time.time()
-                        await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(REALTIME_MODEL))
-                        ok = await wait_for_runtime_ready(timeout=60)
-                        if ok:
-                            prev_model = state.get("current_model")
-                            state["current_model"] = REALTIME_MODEL
-                            try:
-                                model_load_time.labels(model=REALTIME_MODEL).observe(time.time() - t0)
-                                if prev_model != REALTIME_MODEL:
-                                    model_switches.inc()
-                            except Exception:
-                                pass
-                            log.info("returned_to_realtime_proactive", model=REALTIME_MODEL)
-                    except Exception as e:
-                        log.error("failed_switch_to_realtime_proactive", error=str(e))
+                if state.get("current_model") != REALTIME_MODEL:
+                    loading_task = state.get("loading_task")
+                    loading_model = state.get("loading_model")
+                    already_loading_rt = bool(loading_task) and (not loading_task.done()) and (loading_model == REALTIME_MODEL)
+                    if not already_loading_rt:
+                        log.info(
+                            "no_batch_jobs_switching_to_realtime_proactive",
+                            from_model=state.get("current_model"),
+                            to_model=REALTIME_MODEL,
+                        )
+                        try:
+                            await ensure_realtime_model_loading()
+                        except Exception as e:
+                            log.error("failed_switch_to_realtime_proactive", error=str(e))
                 await asyncio.sleep(1.0)
                 continue
             
@@ -1845,22 +1844,12 @@ async def batch_planner_loop():
                 except Exception:
                     pass
             else:
-                # Already on the right model, just check it's ready
+                # Already on the right model, just check it's ready; avoid unnecessary restarts
                 ok = await wait_for_runtime_ready(timeout=10)
                 if not ok:
                     log.warning("runtime_not_responding", model=best_model)
-                    # Force restart
-                    await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
-                    await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(best_model))
-                    ok = await wait_for_runtime_ready(timeout=900)
-                    if not ok:
-                        for jid in claimed:
-                            job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
-                            original_ts = float(job_data.get("submit_ts", now()))
-                            await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
-                            await redis.zadd(BATCH_ZSET, {jid: original_ts})
-                        await asyncio.sleep(1.0)
-                        continue
+                    # Do not force restart here; let dedicated switch paths handle it
+                    pass
 
             # While running jobs, prefetch the next model in background
             if len(model_ranking) > 1:
@@ -1977,21 +1966,9 @@ async def batch_planner_loop():
             remaining_jobs = await redis.zcard(BATCH_ZSET)
             if remaining_jobs == 0 and state.get("current_model") != REALTIME_MODEL:
                 log.info("no_batch_jobs_remaining_loading_realtime")
-                await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
                 try:
-                    t0 = time.time()
-                    await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(REALTIME_MODEL))
-                    ok = await wait_for_runtime_ready(timeout=60)
-                    if ok:
-                        prev_model = state.get("current_model")
-                        state["current_model"] = REALTIME_MODEL
-                        try:
-                            model_load_time.labels(model=REALTIME_MODEL).observe(time.time() - t0)
-                            if prev_model != REALTIME_MODEL:
-                                model_switches.inc()
-                        except Exception:
-                            pass
-                        log.info("returned_to_realtime", model=REALTIME_MODEL)
+                    await ensure_realtime_model_loading()
+                    log.info("returned_to_realtime", model=REALTIME_MODEL)
                 except Exception as e:
                     log.error("failed_to_return_to_realtime", error=str(e))
 
