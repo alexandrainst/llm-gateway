@@ -15,7 +15,13 @@ Usage:
 
 import sys
 import json
-import tomllib
+try:
+    import tomllib  # Python 3.11+
+except Exception:  # pragma: no cover
+    try:
+        import tomli as tomllib  # Backport for Python <3.11
+    except Exception:
+        tomllib = None  # Fallback: config loading will return None
 import importlib.util
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -24,7 +30,7 @@ from typing import Dict, Any, Optional
 def load_eval_config(eval_name: str) -> Optional[Dict[str, Any]]:
     """Load eval configuration from eval.toml if it exists."""
     config_path = Path(__file__).parent / "evals" / eval_name / "eval.toml"
-    if config_path.exists():
+    if config_path.exists() and tomllib is not None:
         with open(config_path, "rb") as f:
             return tomllib.load(f)
     return None

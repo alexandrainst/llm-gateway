@@ -1,4 +1,4 @@
 {
-  "default_evals": ["ifeval-da", "euroeval"],
+  "default_evals": ["ifeval-da", "euroeval", "RULER-da"],
   "_disabled_evals": ["example_eval"]
 }

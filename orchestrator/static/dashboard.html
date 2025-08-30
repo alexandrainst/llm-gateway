@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LLM Gateway Dashboard</title>
   <style>
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #0b0f14; color: #e7eef5; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #0b0f14; color: #e7eef5; max-width: 100vw; overflow-x: hidden; }
     h1 { margin: 0 0 12px 0; font-size: 20px; }
     .row { display: flex; flex-wrap: wrap; gap: 12px; }
     .card { background: #121822; border: 1px solid #1e2733; border-radius: 8px; padding: 12px; flex: 1 1 320px; }
@@ -20,16 +20,23 @@
     button { padding: 6px 10px; background: #1e2733; color: #e7eef5; border: 1px solid #293445; border-radius: 6px; cursor: pointer; }
     button:hover { background: #263041; }
     .footer { margin-top: 16px; color: #73859a; font-size: 12px; }
-    .scroll-x { overflow-x: auto; }
+    .scroll-x { overflow-x: auto; width: 100%; max-width: 100vw; -webkit-overflow-scrolling: touch; }
     .nowrap { white-space: nowrap; }
     .muted { color: #9fb0c3; font-size: 12px; }
     /* Matrix-specific tweaks for compactness */
-    .matrix-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    /* Matrix should be at least full width, and expand beyond viewport when many columns, scrolling within its container */
+    .matrix-table { min-width: 100%; width: max-content; border-collapse: collapse; table-layout: fixed; }
     .matrix-table thead th { position: sticky; top: 0; background: #0e141d; z-index: 2; }
     .matrix-table thead tr.group-row th { top: 0; }
     .matrix-table thead tr.header-row th { top: 30px; }
     .matrix-table th, .matrix-table td { text-align: center; padding: 6px 8px; border-bottom: 1px solid #1e2733; font-size: 13px; }
     .matrix-table td { font-variant-numeric: tabular-nums; }
+    /* Zebra striping for better readability */
+    .matrix-table tbody tr:nth-child(odd) { background: #111825; }
+    .matrix-table tbody tr:nth-child(even) { background: #121822; }
+    /* Ensure sticky first column matches row background */
+    .sticky-col { background: inherit; }
+    .matrix-table thead th.sticky-col { background: #0e141d; }
     .matrix-table td .num { display: block; line-height: 1.15; }
     .matrix-table td .num.secondary { opacity: 0.85; font-size: 12px; }
     .sticky-col { position: sticky; left: 0; background: #121822; z-index: 3; box-shadow: 1px 0 0 #1e2733; text-align: left; }
@@ -54,6 +61,15 @@
     // Sorting state for Eval Matrix
     let sortKey = null;   // column key
     let sortDir = 'desc'; // 'asc' | 'desc'
+    let modelFilter = localStorage.getItem('model_filter') || '';
+
+    function clearModelFilter() {
+      const mf = document.getElementById('modelFilter');
+      if (mf) mf.value = '';
+      modelFilter = '';
+      localStorage.removeItem('model_filter');
+      refresh();
+    }
 
     async function refresh() {
       try {
@@ -150,7 +166,18 @@
         head.appendChild(colRow);
 
         // Sort rows
-        const sortedRows = [...matrix.rows];
+        // Filter rows by model substring (case-insensitive)
+        const mfEl = document.getElementById('modelFilter');
+        const rawFilter = (mfEl ? mfEl.value : (localStorage.getItem('model_filter') || modelFilter || ''));
+        const filterVal = (rawFilter || '').trim().toLowerCase();
+        if (filterVal) localStorage.setItem('model_filter', filterVal); else localStorage.removeItem('model_filter');
+
+        const filteredRows = (matrix.rows || []).filter(row => {
+          const m = (row && row.model) ? String(row.model).toLowerCase() : '';
+          return filterVal ? m.includes(filterVal) : true;
+        });
+
+        const sortedRows = [...filteredRows];
         if (sortKey) {
           const col = cols.find(c => c.key === sortKey);
           const metric = col && col.metrics && col.metrics[0];
@@ -245,6 +272,15 @@
 
     window.addEventListener('load', () => {
       document.getElementById('apiKey').value = apiKey;
+      const mf = document.getElementById('modelFilter');
+      if (mf) {
+        mf.value = modelFilter || '';
+        mf.addEventListener('input', () => {
+          modelFilter = mf.value;
+          if (modelFilter) localStorage.setItem('model_filter', modelFilter); else localStorage.removeItem('model_filter');
+          refresh();
+        });
+      }
       refresh();
       setInterval(refresh, 5000);
     });
@@ -272,12 +308,29 @@
       <input type="text" id="apiKey" placeholder="paste API key" />
       <button onclick="saveKey()">Save</button>
       <div id="error" style="margin-top:8px;color:#e74c3c;"></div>
+
+      <div style="height:1px; background:#1e2733; margin:12px 0;"></div>
+      <h3 style="margin:0 0 8px 0; font-size:14px; color:#9fb0c3;">Submit Evaluation</h3>
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <label for="evalModel" class="k">Model</label>
+        <input type="text" id="evalModel" placeholder="e.g., gemma-3-4b-dfm-v1-7" style="width:260px">
+        <button onclick="submitEval()">Submit</button>
+        <span id="evalSubmitMsg" class="muted"></span>
+      </div>
+      <div class="muted" style="margin-top:6px">Uses saved API key. Model must exist on disk (uploaded or HF cached).</div>
     </div>
   </div>
 
   <div class="row" style="margin-top:12px;">
     <div class="card" style="flex:1 1 100%">
-      <h3>Eval Results Matrix</h3>
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;">
+        <h3 style="margin:0">Eval Results Matrix</h3>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <label for="modelFilter" class="k">Filter</label>
+          <input type="text" id="modelFilter" placeholder="filter models..." style="width:220px">
+          <button onclick="clearModelFilter()">Clear</button>
+        </div>
+      </div>
       <div class="scroll-x">
         <table class="matrix-table">
           <thead id="evalMatrixHead"></thead>
@@ -288,18 +341,6 @@
     </div>
   </div>
 
-  <div class="row" style="margin-top:12px;">
-    <div class="card" style="flex:1 1 100%">
-      <h3>Submit Evaluation</h3>
-      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-        <label for="evalModel" class="k">Model</label>
-        <input type="text" id="evalModel" placeholder="e.g., gemma-3-4b-dfm-v1-7" style="width:360px">
-        <button onclick="submitEval()">Submit</button>
-        <span id="evalSubmitMsg" class="muted"></span>
-      </div>
-      <div class="muted" style="margin-top:6px">Tip: model must exist on disk (uploaded or HF cached). Uses the saved API key to authorize and pass to scoring.</div>
-    </div>
-  </div>
 
   <div class="row" style="margin-top:12px;">
     <div class="card">

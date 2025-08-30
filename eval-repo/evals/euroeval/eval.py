@@ -12,7 +12,13 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Any
-import tomllib
+try:
+    import tomllib
+except Exception:  # pragma: no cover
+    try:
+        import tomli as tomllib
+    except Exception:
+        tomllib = None
 
 # Disable tqdm progress bars in non-interactive environments
 os.environ["TQDM_DISABLE"] = "1"
@@ -25,8 +31,11 @@ from euroeval import Benchmarker
 
 # Load configuration
 CONFIG_FILE = Path(__file__).parent / "eval.toml"
-with open(CONFIG_FILE, "rb") as f:
-    CONFIG = tomllib.load(f)
+if tomllib is not None and CONFIG_FILE.exists():
+    with open(CONFIG_FILE, "rb") as f:
+        CONFIG = tomllib.load(f)
+else:
+    CONFIG = {}
 
 
 def prepare_requests(model_name: str, **kwargs) -> Dict[str, Any]:

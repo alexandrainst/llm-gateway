@@ -10,11 +10,13 @@ import subprocess
 import uuid
 from datetime import datetime
 from pathlib import Path
+import shutil
 from typing import Dict, List, Optional, Any
 from enum import Enum
 from model_utils import detect_is_base_model
 import structlog
 from fastapi import APIRouter, HTTPException, Depends, Request
+import math
 
 logger = structlog.get_logger()
 
@@ -38,51 +40,149 @@ async def run_eval_command(eval_name: str, eval_repo_path: Path, cmd_args: List[
     has_deps = (eval_dir / "pyproject.toml").exists() or (eval_dir / "requirements.txt").exists()
     
     if has_deps:
-        # Create venv if it doesn't exist
-        if not venv_path.exists():
-            logger.info(f"Creating venv for {eval_name} at {venv_path}")
-            logger.info(f"Working directory: {eval_dir}")
-            # Create venv with uv (use full path)
+        # Ensure venv exists (and repair if broken)
+        async def create_or_repair_venv(recreate: bool = False) -> bool:
             try:
+                # If requested, remove any existing venv first
+                if recreate and venv_path.exists():
+                    try:
+                        shutil.rmtree(venv_path)
+                    except Exception:
+                        pass
+                args = ["/usr/local/bin/uv", "venv", str(venv_path)]
                 venv_result = await asyncio.create_subprocess_exec(
-                    "/usr/local/bin/uv", "venv", str(venv_path),
+                    *args,
                     cwd=str(eval_dir),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE
                 )
                 stdout, stderr = await venv_result.communicate()
                 if venv_result.returncode != 0:
-                    logger.error(f"Failed to create venv: {stderr.decode()}")
-                else:
-                    logger.info(f"Created venv successfully")
+                    logger.error(f"Failed to {'re' if recreate else ''}create venv: {stderr.decode(errors='replace')}")
+                    return False
+                logger.info(f"{'Re' if recreate else 'C'}reated venv successfully for {eval_name}")
+                return True
             except Exception as e:
                 logger.error(f"Exception creating venv: {e}")
-                raise
-            
-            # Install dependencies
-            if (eval_dir / "pyproject.toml").exists():
-                logger.info(f"Installing dependencies for {eval_name} from pyproject.toml...")
-                install_result = await asyncio.create_subprocess_exec(
-                    "/usr/local/bin/uv", "pip", "install", "-e", ".",
-                    cwd=str(eval_dir),
-                    env={**os.environ, "VIRTUAL_ENV": str(venv_path)},
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-                await install_result.communicate()
-            elif (eval_dir / "requirements.txt").exists():
-                logger.info(f"Installing dependencies for {eval_name} from requirements.txt...")
-                install_result = await asyncio.create_subprocess_exec(
-                    "/usr/local/bin/uv", "pip", "install", "-r", "requirements.txt",
-                    cwd=str(eval_dir),
-                    env={**os.environ, "VIRTUAL_ENV": str(venv_path)},
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-                await install_result.communicate()
-        
+                return False
+
+        # Create if missing
+        if not venv_path.exists():
+            ok_venv = await create_or_repair_venv(recreate=False)
+            if not ok_venv:
+                # Fail early if venv cannot be created
+                return 1, b"", f"Failed to create venv for {eval_name}".encode()
+
+        # Detect broken interpreter symlinks and repair
+        py3 = venv_path / "bin" / "python3"
+        py = venv_path / "bin" / "python"
+        def _broken(p: Path) -> bool:
+            # Broken if the path lexists but does not exist (dangling symlink)
+            try:
+                return p.is_symlink() and not p.exists()
+            except Exception:
+                return False
+        if _broken(py3) or _broken(py):
+            logger.warning(f"Detected broken venv interpreter for {eval_name}; reinstalling venv")
+            ok_fix = await create_or_repair_venv(recreate=True)
+            if not ok_fix:
+                return 1, b"", f"Failed to repair venv for {eval_name}".encode()
+
+        # Install dependencies using uv pip (pip-less venvs supported)
+        uv_env = {**os.environ, "VIRTUAL_ENV": str(venv_path), "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
+
+        if (eval_dir / "pyproject.toml").exists():
+            logger.info(f"Syncing dependencies for {eval_name} (pyproject.toml via uv pip)...")
+            install_result = await asyncio.create_subprocess_exec(
+                "/usr/local/bin/uv", "pip", "install", "-e", ".",
+                cwd=str(eval_dir), env=uv_env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            out, err = await install_result.communicate()
+            if install_result.returncode != 0:
+                err_text = err.decode(errors='replace')
+                logger.error(f"uv pip install -e . failed for {eval_name}: {err_text}")
+                # If failure indicates broken interpreter, repair and retry once
+                if "Broken symlink" in err_text or "Failed to inspect Python interpreter" in err_text:
+                    logger.info(f"Repairing venv for {eval_name} and retrying uv pip install -e .")
+                    ok_fix = await create_or_repair_venv(recreate=True)
+                    if not ok_fix:
+                        return 1, b"", f"Failed to repair venv for {eval_name}".encode()
+                    install_result = await asyncio.create_subprocess_exec(
+                        "/usr/local/bin/uv", "pip", "install", "-e", ".",
+                        cwd=str(eval_dir), env=uv_env,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                    )
+                    out, err = await install_result.communicate()
+                    if install_result.returncode == 0:
+                        logger.info(f"uv pip install -e . succeeded after venv repair for {eval_name}")
+                    else:
+                        err_text = err.decode(errors='replace')
+                        logger.error(f"uv pip install -e . failed after repair for {eval_name}: {err_text}")
+                # Fallback: install only declared dependencies from pyproject without packaging the project
+                try:
+                    import tomllib
+                    with open(eval_dir / "pyproject.toml", "rb") as f:
+                        pyproj = tomllib.load(f)
+                    deps = pyproj.get("project", {}).get("dependencies", [])
+                    if deps:
+                        logger.info(f"Falling back to installing declared dependencies for {eval_name} via uv pip: {len(deps)} packages")
+                        fallback = await asyncio.create_subprocess_exec(
+                            "/usr/local/bin/uv", "pip", "install", *deps,
+                            cwd=str(eval_dir), env=uv_env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                        )
+                        fout, ferr = await fallback.communicate()
+                        if fallback.returncode != 0:
+                            ferr_text = ferr.decode(errors='replace')
+                            logger.error(f"uv pip install deps fallback failed for {eval_name}: {ferr_text}")
+                            if "Broken symlink" in ferr_text or "Failed to inspect Python interpreter" in ferr_text:
+                                logger.info(f"Repairing venv for {eval_name} and retrying deps fallback")
+                                ok_fix = await create_or_repair_venv(recreate=True)
+                                if not ok_fix:
+                                    return 1, b"", f"Failed to repair venv for {eval_name}".encode()
+                                fallback = await asyncio.create_subprocess_exec(
+                                    "/usr/local/bin/uv", "pip", "install", *deps,
+                                    cwd=str(eval_dir), env=uv_env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                                )
+                                fout, ferr = await fallback.communicate()
+                                if fallback.returncode != 0:
+                                    logger.error(f"uv pip install deps fallback failed after repair for {eval_name}: {ferr.decode(errors='replace')}")
+                    else:
+                        logger.warning(f"No dependencies found in pyproject for {eval_name}; skipping install fallback")
+                except Exception as fe:
+                    logger.error(f"Failed to parse pyproject for deps fallback ({eval_name}): {fe}")
+        elif (eval_dir / "requirements.txt").exists():
+            logger.info(f"Syncing dependencies for {eval_name} (requirements.txt via uv pip)...")
+            install_result = await asyncio.create_subprocess_exec(
+                "/usr/local/bin/uv", "pip", "install", "-r", "requirements.txt",
+                cwd=str(eval_dir), env=uv_env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            out, err = await install_result.communicate()
+            if install_result.returncode != 0:
+                err_text = err.decode(errors='replace')
+                logger.error(f"uv pip install -r requirements.txt failed for {eval_name}: {err_text}")
+                if "Broken symlink" in err_text or "Failed to inspect Python interpreter" in err_text:
+                    logger.info(f"Repairing venv for {eval_name} and retrying uv pip -r requirements.txt")
+                    ok_fix = await create_or_repair_venv(recreate=True)
+                    if not ok_fix:
+                        return 1, b"", f"Failed to repair venv for {eval_name}".encode()
+                    install_result = await asyncio.create_subprocess_exec(
+                        "/usr/local/bin/uv", "pip", "install", "-r", "requirements.txt",
+                        cwd=str(eval_dir), env=uv_env,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                    )
+                    out, err = await install_result.communicate()
+                    if install_result.returncode != 0:
+                        logger.error(f"uv pip install -r requirements.txt failed after repair for {eval_name}: {err.decode(errors='replace')}")
+
         # Use the venv's Python
-        python_cmd = str(venv_path / "bin" / "python")
+        python_exec = venv_path / "bin" / "python"
+        if not python_exec.exists():
+            return 1, b"", f"Venv interpreter missing for {eval_name}".encode()
+        python_cmd = str(python_exec)
     else:
         # No dependencies, use system Python
         python_cmd = "python"
@@ -290,15 +390,18 @@ class EvalManager:
             # Clean up from active evals
             self.active_evals.pop(job_id, None)
     
-    def _check_is_base_model(self, model: str) -> bool:
-        """Detect base vs instruction by calling the shared detector."""
+    async def _check_is_base_model(self, model: str) -> bool:
+        """Detect base vs instruction. Runs in a thread to avoid blocking the event loop.
+        Also ensures minimal tokenizer/config files are fetched into the cache if missing.
+        """
         try:
-            is_base = detect_is_base_model(model)
+            loop = asyncio.get_running_loop()
+            is_base = await loop.run_in_executor(None, detect_is_base_model, model)
             logger.info(f"Model {model} is_base: {is_base}")
             return is_base
         except Exception as e:
-            logger.warning(f"Detection error for {model}: {e}; defaulting to base")
-            return True
+            logger.warning(f"Detection error for {model}: {e}; defaulting to instruct")
+            return False
     
     async def _submit_requests(self, job_id: str, model: str, user_token: str) -> Optional[Dict]:
         """
@@ -307,7 +410,7 @@ class EvalManager:
         Returns dict with completion_ids, eval_groups, and metadata.
         """
         # Check if model is a base model
-        is_base_model = self._check_is_base_model(model)
+        is_base_model = await self._check_is_base_model(model)
         
         # Ask eval repo which evals to run, passing base model flag
         list_cmd = ["python", f"{self.eval_repo_path}/run_eval.py", "list"]
@@ -334,82 +437,102 @@ class EvalManager:
         
         logger.info(f"Running evals: {eval_names}")
         
-        all_completion_ids = []
-        eval_groups = {}
+        all_completion_ids: list[str] = []
+        eval_groups: dict[str, list[str]] = {}
         metadata = {
             "model": model,
             "timestamp": datetime.utcnow().isoformat(),
             "eval_suite": "standard",
         }
-        
-        for eval_name in eval_names:
-            try:
-                # Phase 1a: Get requests from eval
-                cmd_args = [
-                    f"{self.eval_repo_path}/run_eval.py",
-                    "prepare", eval_name, model
-                ]
-                if is_base_model:
-                    cmd_args.append("--base-model")
-                
-                returncode, stdout, stderr = await run_eval_command(
-                    eval_name, self.eval_repo_path, cmd_args
-                )
-                
-                if returncode != 0:
-                    logger.error(f"prepare requests failed for {eval_name}: {stderr.decode()}")
-                    continue
-                
-                prepare_result = json.loads(stdout.decode())
-                requests = prepare_result.get("requests", [])
-                eval_metadata = prepare_result.get("metadata", {})
-                
-                # Phase 1b: Submit requests as batch jobs (directly to Redis)
-                completion_ids = []
-                for request in requests:
-                    # Generate completion ID
-                    comp_id = f"comp_{uuid.uuid4().hex[:12]}"
-                    
-                    # Ensure model is set in request
-                    request["model"] = model
-                    
-                    # Convert to Redis job format using helper
-                    job_data = request_to_redis_job(
-                        request, 
-                        model, 
-                        comp_id,
-                        eval_name=eval_name  # Extra metadata for eval tracking
+
+        # Prepare and submit requests for all evals concurrently so the planner sees work ASAP
+        sem = asyncio.Semaphore(int(os.getenv("EVAL_PREP_CONCURRENCY", "3")))
+
+        async def prepare_and_submit(eval_name: str):
+            async with sem:
+                try:
+                    cmd_args = [
+                        f"{self.eval_repo_path}/run_eval.py",
+                        "prepare", eval_name, model
+                    ]
+                    if is_base_model:
+                        cmd_args.append("--base-model")
+
+                    rc, out, err = await run_eval_command(eval_name, self.eval_repo_path, cmd_args)
+                    if rc != 0:
+                        # Persist prepare stdout/stderr for troubleshooting
+                        try:
+                            job = await self.get_eval_status(job_id)
+                            created_at = job.get("created_at") if job else None
+                            ts = datetime.fromisoformat(created_at).strftime("%Y-%m-%d_%H-%M-%S") if created_at else datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+                            safe_model = model.replace("/", "--").replace(":", "_")
+                            log_dir = self.data_dir / safe_model / ts
+                            log_dir.mkdir(parents=True, exist_ok=True)
+                            log_file = log_dir / f"{eval_name}_prepare.log"
+                            with open(log_file, "w", encoding="utf-8") as f:
+                                f.write(f"Command: {' '.join(cmd_args)}\n")
+                                f.write(f"Return code: {rc}\n\n")
+                                if out:
+                                    try:
+                                        f.write("[STDOUT]\n")
+                                        f.write(out.decode(errors='replace'))
+                                        f.write("\n\n")
+                                    except Exception:
+                                        pass
+                                if err:
+                                    try:
+                                        f.write("[STDERR]\n")
+                                        f.write(err.decode(errors='replace'))
+                                        f.write("\n")
+                                    except Exception:
+                                        pass
+                            logger.error(f"prepare requests failed for {eval_name}: {err.decode(errors='replace')}", log_path=str(log_file))
+                        except Exception as le:
+                            logger.error(f"prepare requests failed for {eval_name} and could not write log: {le}")
+                        return eval_name, []
+
+                    prepare_result = json.loads(out.decode())
+                    requests = prepare_result.get("requests", [])
+                    eval_meta = prepare_result.get("metadata", {})
+
+                    completion_ids_local: list[str] = []
+                    for request in requests:
+                        comp_id = f"comp_{uuid.uuid4().hex[:12]}"
+                        request["model"] = model
+                        job_data = request_to_redis_job(
+                            request,
+                            model,
+                            comp_id,
+                            eval_name=eval_name,
+                            eval_job_id=job_id,
+                        )
+                        await self.redis.hset(f"job:{comp_id}", mapping=job_data)
+                        await self.redis.expire(f"job:{comp_id}", 7 * 24 * 3600)
+                        await self.redis.zadd("z:batchjobs", {comp_id: datetime.utcnow().timestamp()})
+                        completion_ids_local.append(comp_id)
+
+                    # Store per-eval metadata for scoring
+                    await self.redis.setex(
+                        f"eval_metadata:{job_id}:{eval_name}",
+                        7 * 24 * 3600,
+                        json.dumps(eval_meta)
                     )
-                    
-                    # Store job in Redis with 7 day TTL
-                    await self.redis.hset(f"job:{comp_id}", mapping=job_data)
-                    await self.redis.expire(f"job:{comp_id}", 7 * 24 * 3600)
-                    
-                    # Add to batch queue with current timestamp as score
-                    await self.redis.zadd("z:batchjobs", {comp_id: datetime.utcnow().timestamp()})
-                    
-                    completion_ids.append(comp_id)
-                    
-                    logger.debug(f"Submitted batch job {comp_id} for eval {eval_name}")
-                
-                all_completion_ids.extend(completion_ids)
-                eval_groups[eval_name] = completion_ids
-                
-                # Store eval metadata for scoring later
-                await self.redis.setex(
-                    f"eval_metadata:{job_id}:{eval_name}",
-                    7 * 24 * 3600,
-                    json.dumps(eval_metadata)
-                )
-                
-                logger.info(f"Submitted {len(completion_ids)} requests for {eval_name}")
-                
-            except Exception as e:
-                import traceback
-                logger.error(f"Error processing eval {eval_name}: {e}")
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                continue
-        
+
+                    logger.info(f"Submitted {len(completion_ids_local)} requests for {eval_name}")
+                    return eval_name, completion_ids_local
+                except Exception as e:
+                    import traceback
+                    logger.error(f"Error processing eval {eval_name}: {e}")
+                    logger.error(f"Traceback: {traceback.format_exc()}")
+                    return eval_name, []
+
+        tasks = [asyncio.create_task(prepare_and_submit(name)) for name in eval_names]
+        for task in asyncio.as_completed(tasks):
+            name, cids = await task
+            if cids:
+                eval_groups[name] = cids
+                all_completion_ids.extend(cids)
+
         metadata["total_requests"] = len(all_completion_ids)
         
         return {
@@ -881,6 +1004,16 @@ async def submit_evaluation(
     }
 
 
+def _sanitize_for_json(obj):
+    """Recursively replace non-finite floats (NaN/Inf) with None to satisfy strict JSON."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    return obj
+
 @router.get("/{job_id}")
 async def get_eval_status(
     job_id: str,
@@ -891,8 +1024,160 @@ async def get_eval_status(
     
     if not status:
         raise HTTPException(status_code=404, detail=f"Evaluation job {job_id} not found")
-    
-    return status
+    # Sanitize NaN/Inf values that break strict JSON responses
+    return _sanitize_for_json(status)
+
+
+@router.post("/rescore")
+async def rescore_evaluation(
+    request_body: Dict,
+    eval_manager: EvalManager = Depends(get_eval_manager)
+):
+    """Re-score eval results from stored responses (no new inference).
+    Body options:
+      - { job_id: str, eval_name?: str }
+      - { model: str, eval_name?: str }  # uses latest eval job for that model
+    """
+    job_id = (request_body.get("job_id") or "").strip() or None
+    model_filter = (request_body.get("model") or "").strip() or None
+
+    # If job_id not provided, find latest eval_job for model
+    if not job_id:
+        if not model_filter:
+            raise HTTPException(status_code=400, detail="Provide either job_id or model")
+        # Scan eval jobs and pick latest by created_at
+        cursor = 0
+        latest_job_id: str | None = None
+        latest_ts = None
+        while True:
+            cursor, keys = await eval_manager.redis.scan(cursor, match="eval_job:*", count=200)
+            for k in keys:
+                try:
+                    raw = await eval_manager.redis.get(k)
+                    if not raw:
+                        continue
+                    jd = json.loads(raw)
+                    if jd.get("model") != model_filter:
+                        continue
+                    ts_raw = jd.get("created_at") or jd.get("created")
+                    ts_val = None
+                    if isinstance(ts_raw, str):
+                        try:
+                            ts_val = datetime.fromisoformat(ts_raw)
+                        except Exception:
+                            ts_val = None
+                    # Fallback: if missing/invalid, keep but don't override a valid latest
+                    if latest_ts is None and ts_val is None and latest_job_id is None:
+                        latest_job_id = k.split(":", 1)[1]
+                    elif ts_val is not None and (latest_ts is None or ts_val > latest_ts):
+                        latest_ts = ts_val
+                        latest_job_id = k.split(":", 1)[1]
+                except Exception:
+                    continue
+            if cursor == 0:
+                break
+        if not latest_job_id:
+            raise HTTPException(status_code=404, detail=f"No eval job found for model '{model_filter}'")
+        job_id = latest_job_id
+
+    # Load job data
+    job_key = f"eval_job:{job_id}"
+    job_data_raw = await eval_manager.redis.get(job_key)
+    if not job_data_raw:
+        raise HTTPException(status_code=404, detail=f"Evaluation job {job_id} not found")
+    try:
+        job_data = json.loads(job_data_raw)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Corrupt eval job record")
+
+    model = job_data.get("model")
+    eval_groups = job_data.get("eval_groups", {})
+    eval_statuses = job_data.get("eval_status", {})
+
+    # Decide which evals to rescore
+    only_eval = request_body.get("eval_name")
+    eval_names = [only_eval] if only_eval else list(eval_groups.keys() or eval_statuses.keys())
+    if not eval_names:
+        raise HTTPException(status_code=400, detail="No evals to rescore for this job")
+
+    results: Dict[str, Dict] = {}
+    errors: Dict[str, str] = {}
+
+    for eval_name in eval_names:
+        cids = eval_groups.get(eval_name) or (eval_statuses.get(eval_name, {}).get("completion_ids") or [])
+        if not cids:
+            errors[eval_name] = "No completion IDs found"
+            continue
+        # Gather requests/responses
+        request_response_pairs: Dict[str, tuple] = {}
+        for comp_id in cids:
+            jobh = await eval_manager.redis.hgetall(f"job:{comp_id}")
+            if not jobh:
+                continue
+            req = redis_job_to_request(jobh)
+            if jobh.get("status") == "completed":
+                try:
+                    resp = json.loads(jobh.get("result", "{}"))
+                except Exception:
+                    resp = {"error": "bad_result_json"}
+            else:
+                resp = {"error": f"status={jobh.get('status')}"}
+            request_response_pairs[comp_id] = (req, resp)
+        # Preserve original order
+        requests = []
+        responses = []
+        for comp_id in cids:
+            if comp_id in request_response_pairs:
+                r, s = request_response_pairs[comp_id]
+                requests.append(r)
+                responses.append(s)
+
+        # Load eval metadata
+        meta_key = f"eval_metadata:{job_id}:{eval_name}"
+        meta_raw = await eval_manager.redis.get(meta_key)
+        metadata = json.loads(meta_raw) if meta_raw else {}
+
+        score_input = {"requests": requests, "responses": responses, "metadata": metadata}
+
+        # Call scoring in the eval's venv
+        cmd_args = [
+            f"{eval_manager.eval_repo_path}/run_eval.py",
+            "score", eval_name
+        ]
+        rc, stdout, stderr = await run_eval_command(
+            eval_name, eval_manager.eval_repo_path, cmd_args,
+            stdin_data=json.dumps(score_input)
+        )
+        if rc != 0:
+            errors[eval_name] = stderr.decode(errors='replace')[:500]
+            continue
+        try:
+            score_result = json.loads(stdout.decode())
+        except Exception as e:
+            errors[eval_name] = f"parse_error: {e}"
+            continue
+
+        # Save to disk and update eval status
+        await eval_manager._save_eval_result(job_id, eval_name, score_result)
+        es = eval_statuses.get(eval_name, {})
+        es.update({
+            "status": "completed",
+            "results": score_result.get("metrics", {}),
+            "details": score_result.get("details", {}),
+        })
+        job_data.setdefault("eval_status", {})[eval_name] = es
+        results[eval_name] = score_result.get("metrics", {})
+
+    # Persist updated job data
+    await eval_manager.redis.setex(job_key, 30 * 24 * 3600, json.dumps(job_data))
+
+    return {
+        "job_id": job_id,
+        "model": model,
+        "rescored": list(results.keys()),
+        "errors": errors,
+        "metrics": results,
+    }
 
 
 @router.get("/")
