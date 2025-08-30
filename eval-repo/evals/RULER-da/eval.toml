@@ -1,0 +1,16 @@
+[eval]
+# RULER (Danish adaptation) via two-phase batch adapter
+# RULER prompts are instruction-style; require an instruction/chat capable model
+requires_instruction_model = true
+description = "RULER long-context evaluation (Danish adaptation)"
+
+[ruler]
+# Benchmark and defaults
+benchmark = "synthetic"
+tasks = "all"            # "all" or comma-separated task ids from scripts/synthetic.yaml
+exclude_qa = true         # optionally drop QA-style tasks
+seq_lengths = [4096, 8192, 16384]      # sequence lengths to generate (tokens-including-output)
+num_samples = 200         # number of samples per task
+
+[display]
+title = "RULER (DA)"
