@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 try:
@@ -122,8 +123,16 @@ def prepare_requests(model_name: str, **kwargs) -> Dict[str, Any]:
     # Tokenizer for dataset generation: prefer OpenAI/tiktoken to avoid HF download
     tok_type, tok_path = ("openai", "cl100k_base")
 
-    # Where to place datasets/preds (mirrors scripts/launch.py layout)
-    root = THIS_DIR / "benchmark_root" / _sanitize_model_dir(model_name) / benchmark
+    # Work directory strategy:
+    # - Prefer external work dir via EVAL_WORK_DIR env (no cleanup by default)
+    # - Else create a temp directory (cleanup by default unless EVAL_KEEP_WORK is set)
+    env_work = os.getenv("EVAL_WORK_DIR")
+    if env_work:
+        root = Path(env_work) / "ruler-da" / _sanitize_model_dir(model_name) / benchmark
+        cleanup = False
+    else:
+        root = Path(tempfile.mkdtemp(prefix=f"ruler-da_{_sanitize_model_dir(model_name)}_{benchmark}_"))
+        cleanup = os.getenv("EVAL_KEEP_WORK", "0") not in ("1", "true", "True")
 
     all_requests: List[Dict[str, Any]] = []
     meta: Dict[str, Any] = {
@@ -131,6 +140,8 @@ def prepare_requests(model_name: str, **kwargs) -> Dict[str, Any]:
         "seq_lengths": seq_lengths,
         "tasks": tasks,
         "base_dir": str(root),
+        "work_dir": str(root),
+        "cleanup": bool(cleanup),
         "dataset_slices": {},  # key: f"{L}:{task}" -> slice indices
     }
 
@@ -287,7 +298,8 @@ def score_results(requests: List[Dict[str, Any]], responses: List[Dict[str, Any]
     Returns per-length metrics and a combined details dict.
     """
     benchmark = metadata.get("benchmark", "synthetic")
-    base_dir = Path(metadata.get("base_dir", THIS_DIR / "benchmark_root"))
+    base_dir = Path(metadata.get("base_dir") or metadata.get("work_dir") or Path(tempfile.mkdtemp(prefix="ruler-da_score_")))
+    will_cleanup = bool(metadata.get("cleanup", False)) and os.getenv("EVAL_KEEP_WORK", "0") not in ("1", "true", "True")
     dataset_slices = metadata.get("dataset_slices", {})
 
     # Group slices by seq_len -> [tasks]
@@ -400,4 +412,13 @@ def score_results(requests: List[Dict[str, Any]], responses: List[Dict[str, Any]
             "wavg_inc": wavg_inc,
         }
 
-    return {"metrics": metrics, "details": details}
+    result = {"metrics": metrics, "details": details}
+
+    # Best-effort cleanup of temporary work dir created at prepare time
+    try:
+        if will_cleanup:
+            shutil.rmtree(base_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    return result
