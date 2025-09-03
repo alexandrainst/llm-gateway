@@ -73,7 +73,7 @@ def prepare_requests(model_name: str, **kwargs) -> Dict:
         request = {
             "messages": [{"role": "user", "content": prompt_data.get("prompt", "")}],
             "temperature": 0.0,
-            "max_tokens": 512,
+            "max_tokens": 2048,
         }
         requests.append(request)
         
