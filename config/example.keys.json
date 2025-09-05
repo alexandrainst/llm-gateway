@@ -1,0 +1,20 @@
+{
+  "keys": [
+    {
+      "id": "example-realtime",
+      "token": "example-realtime-token",
+      "scopes": ["realtime", "monitor"]
+    },
+    {
+      "id": "example-batch",
+      "token": "example-batch-token",
+      "scopes": ["batch"]
+    },
+    {
+      "id": "example-ops",
+      "token": "example-ops-token",
+      "scopes": ["monitor", "upload", "eval", "batch", "realtime"]
+    }
+  ]
+}
+
