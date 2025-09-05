@@ -2,7 +2,7 @@
 import os, time, uuid, json, asyncio, subprocess, socket, collections, math
 import shutil
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 from fastapi import FastAPI, HTTPException, Response, Depends, APIRouter, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -38,7 +38,7 @@ REALTIME_COOLDOWN_S = int(os.getenv("REALTIME_COOLDOWN_S", "120"))
 MIN_HOT_TTL_S = int(os.getenv("MIN_HOT_TTL_S", "600"))
 L_MAX_S = int(os.getenv("L_MAX_S", "600"))
 P_MAX = float(os.getenv("P_MAX", "0.3"))
-TOKENS_B = float(os.getenv("TOKENS_B", "2"))
+TOKENS_B = float(os.getenv("TOKENS_B", "3"))
 REFILL_PER_SEC = float(os.getenv("TOKENS_REFILL_PER_SEC", "0.000555"))
 MAX_CONCURRENT_BATCH = int(os.getenv("MAX_CONCURRENT_BATCH", "64"))
 
@@ -181,6 +181,10 @@ class CompletionRequest(BaseModel):
     n: int = 1
     stream: bool = False
     stop: list[str] = None
+    # Optional logprobs fields (OpenAI compat)
+    # For vLLM Completions, logprobs should be an integer top-K
+    logprobs: Optional[Union[int, bool]] = None
+    top_logprobs: Optional[int] = None
     
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -191,6 +195,10 @@ class ChatCompletionRequest(BaseModel):
     n: int = 1
     stream: bool = False
     stop: list[str] = None
+    # Optional logprobs fields for chat
+    # vLLM Chat expects logprobs: bool and top_logprobs: int
+    logprobs: Optional[bool] = None
+    top_logprobs: Optional[int] = None
 
 class JobSubmit(BaseModel):
     model: str  # Changed from model_id for consistency
@@ -1446,7 +1454,22 @@ async def completions(req: CompletionRequest, response: Response, auth: bool = D
     # Check if realtime model is hot
     if state.get("current_model") == REALTIME_MODEL and is_runtime_ready():
         try:
-            return await runtime_proxy("/v1/completions", req.dict(), source="realtime")
+            payload = req.dict()
+            # Adjust logprobs semantics for completions: vLLM expects integer top-K
+            lp = payload.get("logprobs")
+            tlp = payload.get("top_logprobs")
+            if lp is not None:
+                if isinstance(lp, bool):
+                    if lp:
+                        payload["logprobs"] = int(tlp) if isinstance(tlp, int) and tlp > 0 else 8
+                    else:
+                        payload.pop("logprobs", None)
+                elif isinstance(lp, int) and lp <= 0:
+                    payload.pop("logprobs", None)
+            # Remove top_logprobs for completions
+            if "top_logprobs" in payload:
+                payload.pop("top_logprobs", None)
+            return await runtime_proxy("/v1/completions", payload, source="realtime")
         except httpx.ConnectError as e:
             # Runtime is actually down
             log.error("completions_proxy_connect_error", error=str(e))
@@ -2040,8 +2063,30 @@ async def batch_planner_loop():
                             "temperature": float(jobh.get("temperature", 0.7)),
                             "top_p": float(jobh.get("top_p", 1.0)),
                             "n": int(jobh.get("n", 1)),
-                            "stop": json.loads(jobh.get("stop", "null"))
                         }
+                        # Optional: stop
+                        try:
+                            stop_val = json.loads(jobh.get("stop", "null"))
+                            if stop_val not in (None, [], ""):
+                                request_data["stop"] = stop_val
+                        except Exception:
+                            pass
+                        # Optional: logprobs/top_logprobs (vLLM completions expects integer logprobs)
+                        lp = jobh.get("logprobs")
+                        tlp = jobh.get("top_logprobs")
+                        # Determine top-k from either integer or boolean+top_logprobs
+                        topk = None
+                        try:
+                            if lp and lp not in ("0", "false", "False"):
+                                # If lp is numeric string, use it; if boolean true, fallback to tlp or default 8
+                                if lp.isdigit():
+                                    topk = int(lp)
+                                else:
+                                    topk = int(tlp) if (tlp and tlp.isdigit()) else 8
+                        except Exception:
+                            topk = None
+                        if topk is not None:
+                            request_data["logprobs"] = topk
                         res = await runtime_proxy("/v1/completions", request_data, source="batch")
                     else:
                         request_data = {
@@ -2051,8 +2096,23 @@ async def batch_planner_loop():
                             "temperature": float(jobh.get("temperature", 0.7)),
                             "top_p": float(jobh.get("top_p", 1.0)),
                             "n": int(jobh.get("n", 1)),
-                            "stop": json.loads(jobh.get("stop", "null"))
                         }
+                        try:
+                            stop_val = json.loads(jobh.get("stop", "null"))
+                            if stop_val not in (None, [], ""):
+                                request_data["stop"] = stop_val
+                        except Exception:
+                            pass
+                        # Optional: logprobs/top_logprobs (chat expects bool + int)
+                        lp = jobh.get("logprobs")
+                        if lp is not None and lp != "":
+                            request_data["logprobs"] = True if lp in ("1", "true", "True") else False
+                        tlp = jobh.get("top_logprobs")
+                        if tlp is not None and tlp != "":
+                            try:
+                                request_data["top_logprobs"] = int(tlp)
+                            except Exception:
+                                pass
                         res = await runtime_proxy("/v1/chat/completions", request_data, source="batch")
                     
                     if jobh.get("eval_name"):

@@ -249,6 +249,15 @@ def request_to_redis_job(request: Dict[str, Any], model: str, comp_id: str, **ex
     job_data["n"] = str(request.get("n", 1))
     job_data["stop"] = json.dumps(request.get("stop"))
     job_data["priority"] = str(request.get("priority", 0))
+    # Optional: logprobs/top_logprobs for classification label extraction
+    if "logprobs" in request and request["logprobs"] is not None:
+        job_data["logprobs"] = "1" if bool(request.get("logprobs")) else "0"
+    if "top_logprobs" in request and request["top_logprobs"] is not None:
+        try:
+            job_data["top_logprobs"] = str(int(request.get("top_logprobs")))
+        except Exception:
+            # Ignore malformed values
+            pass
     
     return job_data
 
@@ -279,6 +288,20 @@ def redis_job_to_request(job_data: Dict[str, str]) -> Dict[str, Any]:
         request["messages"] = json.loads(messages_str)
     elif job_type == "completion":
         request["prompt"] = job_data.get("prompt", "")
+    
+    # Optional logprobs fields
+    lp = job_data.get("logprobs")
+    if lp is not None and lp != "":
+        try:
+            request["logprobs"] = True if lp in ("1", "true", "True") else False
+        except Exception:
+            pass
+    tlp = job_data.get("top_logprobs")
+    if tlp is not None and tlp != "":
+        try:
+            request["top_logprobs"] = int(tlp)
+        except Exception:
+            pass
     
     return request
 
