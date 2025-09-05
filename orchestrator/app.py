@@ -1,5 +1,5 @@
 # orchestrator/app.py
-import os, time, uuid, json, asyncio, subprocess, socket, collections, math
+import os, time, uuid, json, asyncio, subprocess, socket, collections, math, re
 import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
@@ -599,6 +599,7 @@ async def send_warmup_request():
         log.warning("warmup_request_error", error=str(e))
 
 async def wait_for_runtime_ready(timeout=600):
+    kv_tune_attempted = False  # Prevent multiple auto-tune retries per startup
     runtime_host = get_runtime_host()
     deadline = time.time() + timeout
     log.info("waiting_for_runtime", host=runtime_host, port=RUNTIME_PORT, timeout=timeout)
@@ -617,6 +618,35 @@ async def wait_for_runtime_ready(timeout=600):
                     exit_code = container.attrs.get('State', {}).get('ExitCode', -1)
                     model = state.get("loading_model") or state.get("current_model")
                     logs = container.logs(tail=200).decode('utf-8')
+                    # Detect vLLM KV cache insufficient error and auto-tune max sequence length once
+                    if (RUNTIME_TYPE == "vllm" and not kv_tune_attempted 
+                        and ("estimated maximum model length is" in logs)):
+                        try:
+                            m = re.search(r"estimated maximum model length is\s+(\d+)", logs)
+                            if m:
+                                suggested = int(m.group(1))
+                                margin = int(os.getenv("MAX_MODEL_LEN_MARGIN_TOKENS", "4096"))
+                                tuned = max(1024, suggested - margin)
+                                kv_tune_attempted = True
+                                log.warning(
+                                    "kv_cache_insufficient_autotune",
+                                    model=model, suggested_max_model_len=suggested, tuned_max_model_len=tuned,
+                                )
+                                # Restart with tuned max model len
+                                await asyncio.get_running_loop().run_in_executor(
+                                    None,
+                                    lambda: start_runtime_container_sync(
+                                        model,
+                                        extra_args=f"{RUNTIME_ARGS} --max-model-len {tuned}"
+                                    )
+                                )
+                                # Continue waiting within same timeout window
+                                last_container_check = time.time()
+                                await asyncio.sleep(1.0)
+                                continue
+                        except Exception as _e:
+                            # Fall through to generic handling
+                            pass
                     
                     # Exit code 137 = SIGKILL (often OOM killer)
                     # Exit code 139 = SIGSEGV (segfault)
@@ -1058,6 +1088,19 @@ async def load_realtime_model_async():
 
 async def ensure_realtime_model_loading():
     """Ensure realtime model is loading - returns existing task if already in progress"""
+    # If recent startup failure recorded for realtime model, avoid restart loop
+    try:
+        if redis is not None:
+            recent_fail = await redis.get(f"model_failure:{REALTIME_MODEL}")
+            recent_oom = await redis.get(f"model_oom:{REALTIME_MODEL}")
+            incompatible = await redis.get(f"model_incompatible:{REALTIME_MODEL}")
+            if recent_fail or recent_oom or incompatible:
+                log.warning("realtime_start_blocked_due_to_recent_failure", 
+                            model=REALTIME_MODEL,
+                            failure=bool(recent_fail), oom=bool(recent_oom), incompatible=bool(incompatible))
+                return None
+    except Exception:
+        pass
     # If ANY model is currently loading, don't start a concurrent load; reuse that task
     if state.get("loading_task") and not state["loading_task"].done():
         log.info("another_model_already_loading", loading_model=state.get("loading_model"))
