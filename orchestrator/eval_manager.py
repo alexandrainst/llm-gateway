@@ -328,13 +328,12 @@ class EvalManager:
         # Track active evaluations
         self.active_evals: Dict[str, asyncio.Task] = {}
     
-    async def submit_eval(self, model: str, user_token: str) -> str:
+    async def submit_eval(self, model: str) -> str:
         """
         Submit a model for evaluation.
         
         Args:
             model: Model name/path to evaluate
-            user_token: API token for authentication
             
         Returns:
             job_id for tracking the evaluation
@@ -361,7 +360,7 @@ class EvalManager:
         
         # Start async evaluation task
         task = asyncio.create_task(
-            self._run_eval(job_id, model, user_token)
+            self._run_eval(job_id, model)
         )
         self.active_evals[job_id] = task
         
@@ -374,14 +373,14 @@ class EvalManager:
             return json.loads(data)
         return None
     
-    async def _run_eval(self, job_id: str, model: str, user_token: str):
+    async def _run_eval(self, job_id: str, model: str):
         """Run the full evaluation workflow."""
         try:
             # Update status to submitting
             await self._update_job_status(job_id, EvalStatus.SUBMITTING)
             
             # Phase 1: Submit requests to eval repo
-            submission_result = await self._submit_requests(job_id, model, user_token)
+            submission_result = await self._submit_requests(job_id, model)
             
             if not submission_result:
                 await self._update_job_status(job_id, EvalStatus.FAILED, 
@@ -403,7 +402,7 @@ class EvalManager:
             for eval_name, completion_ids in eval_groups.items():
                 # Start monitoring this eval's completions
                 asyncio.create_task(
-                    self._monitor_eval_completions(job_id, eval_name, completion_ids, user_token)
+                    self._monitor_eval_completions(job_id, eval_name, completion_ids)
                 )
             
         except Exception as e:
@@ -426,7 +425,7 @@ class EvalManager:
             logger.warning(f"Detection error for {model}: {e}; defaulting to instruct")
             return False
     
-    async def _submit_requests(self, job_id: str, model: str, user_token: str) -> Optional[Dict]:
+    async def _submit_requests(self, job_id: str, model: str) -> Optional[Dict]:
         """
         Phase 1: Get requests from eval repo and submit them as batch jobs.
         
@@ -565,7 +564,7 @@ class EvalManager:
         }
     
     async def _monitor_eval_completions(self, job_id: str, eval_name: str, 
-                                       completion_ids: List[str], user_token: str):
+                                       completion_ids: List[str]):
         """Monitor completions for a specific eval and trigger scoring when ready."""
         try:
             # Update eval-specific status
@@ -611,7 +610,7 @@ class EvalManager:
             # All completions done, trigger scoring
             await self._update_eval_status(job_id, eval_name, {"status": "scoring"})
             
-            score_result = await self._score_results(job_id, eval_name, completion_ids, user_token)
+            score_result = await self._score_results(job_id, eval_name, completion_ids)
             
             if score_result:
                 await self._update_eval_status(job_id, eval_name, {
@@ -636,7 +635,7 @@ class EvalManager:
             })
     
     async def _score_results(self, job_id: str, eval_name: str, 
-                            completion_ids: List[str], user_token: str) -> Optional[Dict]:
+                            completion_ids: List[str]) -> Optional[Dict]:
         """
         Phase 2: Gather results and call eval repo to score them.
         
@@ -1012,12 +1011,8 @@ async def submit_evaluation(
     model = request_body.get("model")
     if not model:
         raise HTTPException(status_code=400, detail="Model name required")
-    
-    # Get user token from request or use default
-    user_token = request_body.get("api_key") or os.getenv("API_KEY", "changeme")
-    
     # Submit evaluation job
-    job_id = await eval_manager.submit_eval(model, user_token)
+    job_id = await eval_manager.submit_eval(model)
     
     return {
         "job_id": job_id,
