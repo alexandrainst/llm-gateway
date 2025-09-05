@@ -17,8 +17,8 @@ services:
     env_file:
       - .env
     environment:
-      # API authentication
-      API_KEY: ${API_KEY:-changeme}
+      # Auth keys file path inside the orchestrator container
+      AUTH_KEYS_FILE: ${AUTH_KEYS_FILE:-/app-config/auth.keys.json}
       # HuggingFace token for downloading gated models
       HF_TOKEN: ${HF_TOKEN}
       # Note: HOST_HF_CACHE is not set here - the code uses /host_hf_cache by default
@@ -49,6 +49,8 @@ services:
     # bind the docker socket so orchestrator can start/stop runtime containers
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # Mount auth keys file into the container at /app-config/auth.keys.json
+      - ./config/auth.keys.json:/app-config/auth.keys.json:ro
       - ${HOST_HF_CACHE:-/home/alex-admin/.cache/huggingface}:/host_hf_cache:rw
       - ./orchestrator:/app:ro  # Mount entire app read-only for dev
       - ./eval-repo:/home/alex-admin/llm-gateway/eval-repo:rw  # Mount eval repo for running evals (rw for venv creation)

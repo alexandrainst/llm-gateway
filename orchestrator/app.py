@@ -20,7 +20,8 @@ from eval_manager import EvalManager, router as eval_router
 log = structlog.get_logger()
 
 # Config from env
-API_KEY = os.getenv("API_KEY", None)  # Optional API key for auth
+# Auth: static scoped keys loaded from JSON file at startup (no fallback API_KEY)
+AUTH_KEYS_FILE = os.getenv("AUTH_KEYS_FILE")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 # Path INSIDE orchestrator container where host HF cache is mounted
 HOST_HF_CACHE = os.getenv("HOST_HF_CACHE", "/host_hf_cache")
@@ -121,49 +122,58 @@ runtime_ready_metric = Gauge('llm_runtime_ready', 'Runtime ready status (1=ready
 # Error metrics
 model_failures = Counter('llm_model_failures_total', 'Model failures', ['model', 'reason'])
 
-# ============ Authentication ============
+# ============ Authentication (Scoped Keys) ============
 security = HTTPBearer(auto_error=False)
 
-async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify API key if configured"""
-    if not API_KEY:
-        # No API key configured, allow all requests
+# In-memory key store: token -> {"id": str, "scopes": set[str]}
+AUTH_KEYS: Dict[str, Dict[str, Union[str, set[str]]]] = {}
+
+def load_auth_keys_from_file(path: str) -> None:
+    """Load scoped auth keys from a JSON file.
+    Schema: {"keys": [{"id": str, "token": str, "scopes": [str, ...]}]}
+    """
+    global AUTH_KEYS
+    if not path or not os.path.exists(path):
+        raise RuntimeError("AUTH_KEYS_FILE is required and must point to a readable JSON file")
+    with open(path, "r") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or not isinstance(data.get("keys"), list):
+        raise RuntimeError("AUTH_KEYS_FILE must contain an object with a 'keys' list")
+    tmp: Dict[str, Dict[str, Union[str, set[str]]]] = {}
+    for entry in data["keys"]:
+        if not isinstance(entry, dict):
+            continue
+        kid = entry.get("id")
+        token = entry.get("token")
+        scopes = entry.get("scopes", [])
+        if not kid or not token or not isinstance(scopes, list):
+            continue
+        tmp[str(token)] = {"id": str(kid), "scopes": set(map(str, scopes))}
+    if not tmp:
+        raise RuntimeError("AUTH_KEYS_FILE contains no valid keys")
+    AUTH_KEYS = tmp
+
+def make_require_scopes(required: set[str]):
+    async def _dep(credentials: HTTPAuthorizationCredentials = Depends(security)):
+        if not credentials or not credentials.credentials:
+            raise HTTPException(status_code=401, detail="Missing authentication")
+        token = credentials.credentials
+        principal = AUTH_KEYS.get(token)
+        if not principal:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        scopes = principal.get("scopes", set())
+        if not isinstance(scopes, set) or not required.issubset(scopes):
+            raise HTTPException(status_code=403, detail="Insufficient scope")
         return True
-    
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Missing authentication")
-    
-    if credentials.credentials != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    
-    return True
+    return _dep
 
 # -------- Routers --------
-# v1: OpenAI-compatible and batch APIs (auth enforced via dependency)
-v1_router = APIRouter(prefix="/v1", dependencies=[Depends(verify_api_key)])
+# v1: OpenAI-compatible and batch APIs
+v1_router = APIRouter(prefix="/v1")
 
-# uploads: TUS protocol endpoints
+# uploads/UI routers
 upload_router = APIRouter()
 ui_router = APIRouter()
-
-async def verify_api_key_flexible(
-    request: Request,
-    key: str | None = Query(default=None),
-    credentials: HTTPAuthorizationCredentials | None = Depends(security),
-):
-    """Auth helper for UI JSON endpoints: accept Authorization header or ?key= query.
-    If API_KEY is unset, allow all.
-    """
-    if not API_KEY:
-        return True
-    provided = None
-    if key:
-        provided = key
-    elif credentials:
-        provided = credentials.credentials
-    if provided != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return True
 
 @app.get("/healthz")
 async def healthz():
@@ -960,6 +970,9 @@ async def proactive_storage_management():
 # ---------- API & job endpoints ----------
 @app.on_event("startup")
 async def startup():
+    # Load scoped auth keys upfront
+    load_auth_keys_from_file(AUTH_KEYS_FILE)
+
     await redis_connect()
     
     # Clean up any stuck jobs from previous run
@@ -1101,7 +1114,7 @@ async def dashboard_page():
     return HTMLResponse("Dashboard file not found (orchestrator/static/dashboard.html)", status_code=500) 
 
 @ui_router.get("/ui/summary")
-async def ui_summary(auth: bool = Depends(verify_api_key_flexible)):
+async def ui_summary(auth: bool = Depends(make_require_scopes({"monitor"}))):
     """Summarized state for the dashboard."""
     current = state.get("current_model")
     # Container status + quick HTTP health
@@ -1185,7 +1198,7 @@ async def ui_summary(auth: bool = Depends(verify_api_key_flexible)):
     }
 
 @ui_router.get("/ui/queue")
-async def ui_queue(limit: int = 100, auth: bool = Depends(verify_api_key_flexible)):
+async def ui_queue(limit: int = 100, auth: bool = Depends(make_require_scopes({"monitor"}))):
     """Return a sample of queued jobs (and statuses)."""
     ids = await redis.zrange(BATCH_ZSET, 0, max(0, limit - 1)) if redis else []
     items = []
@@ -1204,7 +1217,7 @@ async def ui_queue(limit: int = 100, auth: bool = Depends(verify_api_key_flexibl
     return {"items": items, "queued_total": await redis.zcard(BATCH_ZSET)}
 
 @ui_router.get("/ui/evals")
-async def ui_evals(limit: int = 50, auth: bool = Depends(verify_api_key_flexible)):
+async def ui_evals(limit: int = 50, auth: bool = Depends(make_require_scopes({"monitor"}))):
     """List evaluation jobs by scanning eval_job:* keys (best-effort)."""
     items = []
     if not redis:
@@ -1241,7 +1254,7 @@ async def ui_evals(limit: int = 50, auth: bool = Depends(verify_api_key_flexible
 async def ui_runtime_logs(
     tail: int = 200,
     since_s: float | None = None,
-    auth: bool = Depends(verify_api_key_flexible),
+    auth: bool = Depends(make_require_scopes({"monitor"})),
 ):
     """Return recent runtime container logs for the UI (auth-protected).
     Params:
@@ -1267,7 +1280,7 @@ async def ui_runtime_logs(
         return {"container_status": "error", "text": f"(error fetching logs: {e})", "tail": tail}
 
 @ui_router.get("/ui/eval_matrix")
-async def ui_eval_matrix(auth: bool = Depends(verify_api_key_flexible)):
+async def ui_eval_matrix(auth: bool = Depends(make_require_scopes({"monitor"}))):
     """Return an aggregated matrix of latest eval results.
     Rows = models, Columns = evals (including nested expansions, e.g., euroeval datasets).
     Each column exposes up to two metrics chosen by priority.
@@ -1401,7 +1414,7 @@ async def ui_eval_matrix(auth: bool = Depends(verify_api_key_flexible)):
     }
 
 @v1_router.get("/models")
-async def list_models(auth: bool = Depends(verify_api_key)):
+async def list_models(auth: bool = Depends(make_require_scopes({"realtime"}))):
     """OpenAI-compatible models endpoint - returns only the realtime model"""
     return {
         "object": "list",
@@ -1416,7 +1429,7 @@ async def list_models(auth: bool = Depends(verify_api_key)):
     }
 
 @app.get("/metrics")
-async def metrics(auth: bool = Depends(verify_api_key)):
+async def metrics(auth: bool = Depends(make_require_scopes({"monitor"}))):
     """Prometheus metrics endpoint"""
     # Update runtime ready metric
     runtime_ready_metric.set(1 if is_runtime_ready() else 0)
@@ -1434,7 +1447,7 @@ async def metrics(auth: bool = Depends(verify_api_key)):
     return Response(generate_latest(), media_type="text/plain")
 
 @v1_router.post("/completions")
-async def completions(req: CompletionRequest, response: Response, auth: bool = Depends(verify_api_key)):
+async def completions(req: CompletionRequest, response: Response, auth: bool = Depends(make_require_scopes({"realtime"}))):
     """OpenAI-compatible completions endpoint"""
     # Update realtime arrival tracking for EWMA + hot TTL
     try:
@@ -1505,7 +1518,7 @@ async def completions(req: CompletionRequest, response: Response, auth: bool = D
     }
 
 @v1_router.post("/chat/completions")
-async def chat_completions(req: ChatCompletionRequest, response: Response, auth: bool = Depends(verify_api_key)):
+async def chat_completions(req: ChatCompletionRequest, response: Response, auth: bool = Depends(make_require_scopes({"realtime"}))):
     """OpenAI-compatible chat completions endpoint"""
     # Update realtime arrival tracking for EWMA + hot TTL
     try:
@@ -1559,7 +1572,7 @@ async def chat_completions(req: ChatCompletionRequest, response: Response, auth:
     }
 
 @v1_router.post("/batch/completions")
-async def batch_completions(req: BatchCompletionRequest, response: Response, auth: bool = Depends(verify_api_key)):
+async def batch_completions(req: BatchCompletionRequest, response: Response, auth: bool = Depends(make_require_scopes({"batch"}))):
     """Submit a batch completion request"""
     # Generate completion ID
     completion_id = f"cmpl-{uuid.uuid4().hex[:24]}"
@@ -1596,7 +1609,7 @@ async def batch_completions(req: BatchCompletionRequest, response: Response, aut
     }
 
 @v1_router.get("/batch/completions/{completion_id}")
-async def get_batch_completion(completion_id: str, auth: bool = Depends(verify_api_key)):
+async def get_batch_completion(completion_id: str, auth: bool = Depends(make_require_scopes({"batch"}))):
     """Get status/result of a batch completion"""
     jobkey = JOB_HASH_PREFIX + completion_id
     data = await redis.hgetall(jobkey)
@@ -1632,7 +1645,7 @@ async def get_batch_completion(completion_id: str, auth: bool = Depends(verify_a
     return {"id": completion_id, "status": status}
 
 @v1_router.post("/batch/chat/completions")
-async def batch_chat_completions(req: BatchChatCompletionRequest, response: Response, auth: bool = Depends(verify_api_key)):
+async def batch_chat_completions(req: BatchChatCompletionRequest, response: Response, auth: bool = Depends(make_require_scopes({"batch"}))):
     """Submit a batch chat completion request"""
     # Generate completion ID
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -1669,7 +1682,7 @@ async def batch_chat_completions(req: BatchChatCompletionRequest, response: Resp
     }
 
 @v1_router.get("/batch/chat/completions/{completion_id}")
-async def get_batch_chat_completion(completion_id: str, auth: bool = Depends(verify_api_key)):
+async def get_batch_chat_completion(completion_id: str, auth: bool = Depends(make_require_scopes({"batch"}))):
     """Get status/result of a batch chat completion"""
     jobkey = JOB_HASH_PREFIX + completion_id
     data = await redis.hgetall(jobkey)
@@ -1705,7 +1718,7 @@ async def get_batch_chat_completion(completion_id: str, auth: bool = Depends(ver
 
 
 @v1_router.post("/jobs")
-async def submit_job(j: JobSubmit):
+async def submit_job(j: JobSubmit, auth: bool = Depends(make_require_scopes({"batch"}))):
     job_id = str(uuid.uuid4())
     submit_ts = now()
     jobkey = JOB_HASH_PREFIX + job_id
@@ -1723,7 +1736,7 @@ async def submit_job(j: JobSubmit):
     return {"job_id": job_id}
 
 @v1_router.get("/jobs/{job_id}")
-async def get_job(job_id: str):
+async def get_job(job_id: str, auth: bool = Depends(make_require_scopes({"batch"}))):
     jobkey = JOB_HASH_PREFIX + job_id
     data = await redis.hgetall(jobkey)
     if not data:
@@ -2237,7 +2250,7 @@ UPLOAD_TEMP_DIR = "/tmp/model_uploads"
 Path(UPLOAD_TEMP_DIR).mkdir(parents=True, exist_ok=True)
 
 @upload_router.options("/upload")
-async def tus_options():
+async def tus_options(auth: bool = Depends(make_require_scopes({"upload"}))):
     """TUS discovery endpoint"""
     return Response(
         status_code=204,
@@ -2251,7 +2264,7 @@ async def tus_options():
 @upload_router.post("/upload")
 async def tus_create(
     request: Request,
-    auth: bool = Depends(verify_api_key),
+    auth: bool = Depends(make_require_scopes({"upload"})),
     upload_length: int = Header(None),
     upload_metadata: str = Header(None),
     tus_resumable: str = Header(TUS_VERSION)
@@ -2317,7 +2330,7 @@ async def tus_create(
 @upload_router.head("/upload/{upload_id}")
 async def tus_head(
     upload_id: str,
-    auth: bool = Depends(verify_api_key),
+    auth: bool = Depends(make_require_scopes({"upload"})),
     tus_resumable: str = Header(TUS_VERSION)
 ):
     """TUS resumption endpoint - returns current offset"""
@@ -2338,7 +2351,7 @@ async def tus_head(
 async def tus_patch(
     upload_id: str,
     request: Request,
-    auth: bool = Depends(verify_api_key),
+    auth: bool = Depends(make_require_scopes({"upload"})),
     upload_offset: int = Header(...),
     content_type: str = Header(...),
     tus_resumable: str = Header(TUS_VERSION)
@@ -2517,5 +2530,5 @@ async def _finalize_upload(upload_id: str, upload_data: dict):
 # Mount routers after all endpoints have been defined
 app.include_router(v1_router)
 app.include_router(upload_router)
-app.include_router(eval_router)  # /eval endpoints
+app.include_router(eval_router, dependencies=[Depends(make_require_scopes({"eval"}))])  # /eval endpoints
 app.include_router(ui_router)

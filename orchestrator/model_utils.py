@@ -12,27 +12,8 @@ def _load_json(path: str) -> dict | None:
 
 
 def _looks_like_instruct_from_tokens(cfg: dict[str, Any]) -> bool:
-    """Heuristic: presence of common chat special tokens implies an instruct/chat model."""
-    if not isinstance(cfg, dict):
-        return False
-    # tokenizer_config.json may expose these under various keys
-    specials = []
-    # transformers saves additional_special_tokens as a list
-    specials.extend(cfg.get("additional_special_tokens", []) or [])
-    # Sometimes nested under special_tokens_map
-    stm = cfg.get("special_tokens_map", {}) or {}
-    specials.extend(stm.get("additional_special_tokens", []) or [])
-    # tokenizer.json often contains an added_tokens_decoder mapping
-    added = cfg.get("added_tokens_decoder") or {}
-    if isinstance(added, dict):
-        specials.extend([v.get("content") for v in added.values() if isinstance(v, dict)])
-    # Known chat tokens/templates
-    chat_markers = [
-        "<|im_start|>", "<|im_end|>", "<|system|>", "<|user|>", "<|assistant|>",
-        "[INST]", "[/INST]", "### Instruction", "### Response", "USER:", "ASSISTANT:",
-    ]
-    specials_str = "\n".join([s for s in specials if isinstance(s, str)])
-    return any(marker in specials_str for marker in chat_markers)
+    """Deprecated: no longer used. Kept for compatibility if needed later."""
+    return False
 
 
 def _ensure_tokenizer_files(model_id: str) -> None:
@@ -45,15 +26,10 @@ def _ensure_tokenizer_files(model_id: str) -> None:
         return
     cache_root = os.getenv("HOST_HF_CACHE", "/host_hf_cache")
     token = os.getenv("HF_TOKEN")
+    # Only fetch tokenizer_config.json; detection relies solely on its chat_template
     allow = [
         "tokenizer_config.json",
-        "tokenizer.json",
-        "tokenizer.model",
-        "added_tokens.json",
-        "generation_config.json",
         "*/tokenizer_config.json",
-        "*/tokenizer.json",
-        "*/generation_config.json",
     ]
     try:
         snapshot_download(
@@ -70,15 +46,14 @@ def _ensure_tokenizer_files(model_id: str) -> None:
 
 
 def detect_is_base_model(model_id: str) -> bool:
-    """Detect base vs. instruction model from local HF cache.
+    """Detect base vs instruction using a single rule:
 
-    Strategy (ordered):
-    1) If any snapshot contains a non-empty chat_template (tokenizer_config.json or generation_config.json) → instruct (return False).
-    2) If tokenizer.json/… show common chat special tokens → instruct (return False).
-    3) If model_id name strongly suggests instruct (e.g., "-Instruct", "-it", "-chat") → instruct (return False).
-    4) If we still can't tell, default to instruct (return False) rather than base to avoid forcing chatless flows.
+    - If tokenizer_config.json contains a non-empty "chat_template" in any cached snapshot,
+      treat as instruction (return False).
+    - Otherwise, treat as base (return True).
 
-    Returns True only when we can reasonably infer a base model (explicit chat_template is missing/null across snapshots and no instruct markers found).
+    If the cache is missing, we attempt to fetch tokenizer_config.json; on failure we still
+    return True (base) per the simplified rule.
     """
     try:
         cache_root = os.getenv("HOST_HF_CACHE", "/host_hf_cache")
@@ -123,45 +98,38 @@ def detect_is_base_model(model_id: str) -> bool:
                 hashed.sort(key=lambda x: x[0], reverse=True)
                 candidates.extend([p for _, p in hashed])
 
-        # 1) Look for explicit chat_template first
+        # Look for explicit chat_template in tokenizer_config.json
         for snap in candidates:
-            for fname in ("tokenizer_config.json", "generation_config.json"):
-                cfg = _load_json(os.path.join(snap, fname))
-                if cfg is None:
-                    continue
-                if "chat_template" in cfg:
-                    tmpl = cfg.get("chat_template")
-                    if isinstance(tmpl, str) and tmpl.strip():
-                        return False  # instruct/chat model
-                    # If explicitly null/empty, keep checking other signals
+            cfg = _load_json(os.path.join(snap, "tokenizer_config.json"))
+            if cfg is None:
+                continue
+            if "chat_template" in cfg:
+                tmpl = cfg.get("chat_template")
+                if isinstance(tmpl, str) and tmpl.strip():
+                    return False  # instruct/chat model
 
-        # 2) Heuristics from tokens in tokenizer.json or tokenizer_config.json
-        for snap in candidates:
-            tok_cfg = _load_json(os.path.join(snap, "tokenizer_config.json")) or {}
-            if _looks_like_instruct_from_tokens(tok_cfg):
-                return False
-            tok_json = _load_json(os.path.join(snap, "tokenizer.json")) or {}
-            if _looks_like_instruct_from_tokens(tok_json):
-                return False
-
-        # 3) Name heuristics
-        name = model_id.lower()
-        instruct_markers = ["instruct", "-it", "-chat", "-assistant", "-sft", "-qa"]
-        if any(m in name for m in instruct_markers):
-            return False
-
-        # If we have HF cache and still couldn't confirm instruct, tentatively assume base.
+        # No instruct signal found in available snapshots.
         if os.path.isdir(snapshots_dir):
             return True
+
         # As a last resort, try to fetch minimal tokenizer and test once more
         _ensure_tokenizer_files(model_id)
         if os.path.isdir(snapshots_dir):
-            # Recurse once to re-run detection on newly downloaded configs
-            try:
-                return detect_is_base_model(model_id)
-            except Exception:
-                pass
-        return False
+            # Re-run quickly without recursion to avoid deep calls
+            main_dir = os.path.join(snapshots_dir, "main")
+            snaps = [main_dir] if os.path.isdir(main_dir) else []
+            for name in os.listdir(snapshots_dir):
+                if name != "main":
+                    p = os.path.join(snapshots_dir, name)
+                    if os.path.isdir(p):
+                        snaps.append(p)
+            for snap in snaps:
+                cfg = _load_json(os.path.join(snap, "tokenizer_config.json"))
+                if cfg and isinstance(cfg.get("chat_template"), str) and cfg.get("chat_template").strip():
+                    return False
+            return True
+        # Cache still missing; default to base per simplified rule
+        return True
     except Exception:
-        # On any error, assume instruct to avoid under-detecting chat models.
-        return False
+        # On any error, assume base per simplified rule.
+        return True
