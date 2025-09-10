@@ -1,5 +1,5 @@
 # orchestrator/app.py
-import os, time, uuid, json, asyncio, subprocess, socket, collections, math, re
+import os, time, uuid, json, asyncio, subprocess, socket, collections, math, re, random, hashlib
 import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
@@ -24,7 +24,9 @@ log = structlog.get_logger()
 AUTH_KEYS_FILE = os.getenv("AUTH_KEYS_FILE")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 # Path INSIDE orchestrator container where host HF cache is mounted
-HOST_HF_CACHE = os.getenv("HOST_HF_CACHE", "/host_hf_cache")
+# Use the container-side mount path for the host HF cache consistently.
+# Do not override via env to avoid confusion between host vs container paths.
+HOST_HF_CACHE = "/host_hf_cache"
 # Optional: explicit host path for HF cache (as seen by Docker daemon)
 HOST_HF_CACHE_HOST = os.getenv("HOST_HF_CACHE_HOST", None)
 RUNTIME_TYPE = os.getenv("RUNTIME_TYPE", "sglang")  # "sglang" or "vllm"
@@ -42,6 +44,7 @@ P_MAX = float(os.getenv("P_MAX", "0.3"))
 TOKENS_B = float(os.getenv("TOKENS_B", "3"))
 REFILL_PER_SEC = float(os.getenv("TOKENS_REFILL_PER_SEC", "0.000555"))
 MAX_CONCURRENT_BATCH = int(os.getenv("MAX_CONCURRENT_BATCH", "64"))
+PREEMPT_CANCEL_TIMEOUT_S = float(os.getenv("PREEMPT_CANCEL_TIMEOUT_S", "3.0"))
 
 # Readiness timeouts (seconds)
 DEFAULT_READY_TIMEOUT_S = int(os.getenv("DEFAULT_READY_TIMEOUT_S", "120"))
@@ -609,6 +612,13 @@ async def wait_for_runtime_ready(timeout=600):
     log_interval_s = float(os.getenv("READY_PROBE_LOG_INTERVAL_S", "15"))
     last_http_log = 0.0
     while time.time() < deadline:
+        # Allow cooperative abort of a non-realtime load
+        try:
+            if state.get("load_abort_requested"):
+                log.info("runtime_ready_wait_aborted")
+                return False
+        except Exception:
+            pass
         # Check container health every 5 seconds
         if time.time() - last_container_check > 5:
             try:
@@ -882,14 +892,25 @@ async def download_model_async(model_id: str) -> bool:
         log.info("model_downloaded", model_id=model_id, path=path)
         return True
     except (RepositoryNotFoundError, GatedRepoError) as e:
+        # Definitive failure: mark model as failed and drop queued jobs
         log.error("model_access_denied", model_id=model_id, error=str(e), 
                  hint="Need HuggingFace token or model doesn't exist/is gated")
+        try:
+            await redis.set(f"model_failure:{model_id}", json.dumps({"reason": "access_denied", "ts": now()}))
+            await drop_queued_jobs_for_model(model_id, reason="model_access_denied")
+        except Exception:
+            pass
         return False
     except Exception as e:
         error_msg = str(e)
-        if "401" in error_msg or "authentication" in error_msg.lower() or "token" in error_msg.lower():
+        if ("401" in error_msg) or ("403" in error_msg) or ("authentication" in error_msg.lower()) or ("token" in error_msg.lower()):
             log.error("model_auth_required", model_id=model_id, error=error_msg,
-                     hint="Set HF_TOKEN environment variable")
+                     hint="Set HF_TOKEN environment variable or check access")
+            try:
+                await redis.set(f"model_failure:{model_id}", json.dumps({"reason": "auth_required", "ts": now()}))
+                await drop_queued_jobs_for_model(model_id, reason="model_auth_required")
+            except Exception:
+                pass
         else:
             log.error("model_download_failed", model_id=model_id, error=error_msg)
         return False
@@ -959,7 +980,7 @@ async def analyze_queue_storage_needs() -> Dict[str, Dict]:
                 "on_disk": check_model_on_disk(model_id),
                 "size_bytes": get_model_size_on_disk(model_id) if check_model_on_disk(model_id) else 0,
                 "in_page_cache": False,  # Would need more complex check
-                "is_current": state.get("current_model") == model_id
+                "is_current": state.get("current_model") == model_id,
             }
         
         needs[model_id]["job_count"] += 1
@@ -984,6 +1005,12 @@ async def proactive_storage_management():
     # Download missing models in order of importance
     for model_id, info in models_by_importance:
         if not info["on_disk"] and not info["is_current"]:
+            # Skip models with recent definitive failures
+            try:
+                if await redis.get(f"model_failure:{model_id}"):
+                    continue
+            except Exception:
+                pass
             # Check disk space before downloading
             if await ensure_disk_space(100):  # Assume 100GB needed
                 log.info("proactive_download_starting", model_id=model_id, job_count=info["job_count"])
@@ -1101,16 +1128,59 @@ async def ensure_realtime_model_loading():
                 return None
     except Exception:
         pass
-    # If ANY model is currently loading, don't start a concurrent load; reuse that task
+    # If a model is currently loading, handle preemption semantics
     if state.get("loading_task") and not state["loading_task"].done():
-        log.info("another_model_already_loading", loading_model=state.get("loading_model"))
-        return state["loading_task"]
+        loading_model = state.get("loading_model")
+        log.info("another_model_already_loading", loading_model=loading_model)
+        # If a non-realtime model is loading, request an abort and wait briefly
+        if loading_model and loading_model != REALTIME_MODEL:
+            try:
+                abort_done = state.get("load_abort_done_event")
+                if not isinstance(abort_done, asyncio.Event):
+                    abort_done = asyncio.Event()
+                    state["load_abort_done_event"] = abort_done
+                else:
+                    # Reset to unsignaled for a fresh abort handshake
+                    try:
+                        abort_done.clear()
+                    except Exception:
+                        pass
+                state["load_abort_requested"] = True
+                try:
+                    await asyncio.wait_for(abort_done.wait(), timeout=PREEMPT_CANCEL_TIMEOUT_S)
+                    log.info("load_abort_completed", aborted_model=loading_model)
+                except asyncio.TimeoutError:
+                    log.warning("load_abort_timeout", model=loading_model, timeout_s=PREEMPT_CANCEL_TIMEOUT_S)
+                finally:
+                    # Clear abort request before starting realtime load to avoid aborting it
+                    state["load_abort_requested"] = False
+            except Exception as e:
+                log.warning("load_abort_handshake_error", error=str(e))
+        else:
+            # Realtime already loading; reuse that task
+            return state["loading_task"]
     
     # Create new loading task
     async def load_model_async():
         state["preempt"] = True
         state["loading_model"] = REALTIME_MODEL
         state["rt_cooldown_start_ts"] = now()
+        # Handshake: request drain of active batch tasks before stopping runtime
+        try:
+            # Create or reuse a drain-done event for this preempt
+            drain_done = state.get("preempt_drain_done_event")
+            if not isinstance(drain_done, asyncio.Event):
+                drain_done = asyncio.Event()
+                state["preempt_drain_done_event"] = drain_done
+            state["preempt_drain_requested"] = True
+            # Allow scheduler a brief window to cancel and requeue inflight tasks
+            try:
+                await asyncio.wait_for(drain_done.wait(), timeout=PREEMPT_CANCEL_TIMEOUT_S)
+                log.info("preempt_drain_completed")
+            except asyncio.TimeoutError:
+                log.warning("preempt_drain_timeout", timeout_s=PREEMPT_CANCEL_TIMEOUT_S)
+        except Exception as e:
+            log.warning("preempt_drain_handshake_error", error=str(e))
         try:
             log.info("starting_realtime_model_load", model=REALTIME_MODEL)
             await prefetch_pagecache_async(REALTIME_MODEL)
@@ -1134,6 +1204,15 @@ async def ensure_realtime_model_loading():
             log.error("realtime_model_load_failed", error=str(e))
         finally:
             state["preempt"] = False
+            state["preempt_drain_requested"] = False
+            state["load_abort_requested"] = False
+            try:
+                dd = state.get("preempt_drain_done_event")
+                if isinstance(dd, asyncio.Event):
+                    # Reset the event for future use
+                    dd.clear()
+            except Exception:
+                pass
             state["loading_task"] = None
             state["loading_model"] = None
     
@@ -1642,6 +1721,11 @@ async def batch_completions(req: BatchCompletionRequest, response: Response, aut
     await redis.hset(jobkey, mapping=jobdata)
     await redis.expire(jobkey, 604800)  # 7 days TTL
     await redis.zadd(BATCH_ZSET, {completion_id: submit_ts})
+    # Clear any prior definitive failure to allow re-attempt on new submission
+    try:
+        await redis.delete(f"model_failure:{req.model}")
+    except Exception:
+        pass
     
     # Return 202 Accepted with ID and status URL
     response.status_code = 202
@@ -1715,6 +1799,11 @@ async def batch_chat_completions(req: BatchChatCompletionRequest, response: Resp
     await redis.hset(jobkey, mapping=jobdata)
     await redis.expire(jobkey, 604800)  # 7 days TTL
     await redis.zadd(BATCH_ZSET, {completion_id: submit_ts})
+    # Clear prior failure on new submission for this model
+    try:
+        await redis.delete(f"model_failure:{req.model}")
+    except Exception:
+        pass
     
     # Return 202 Accepted
     response.status_code = 202
@@ -1776,6 +1865,11 @@ async def submit_job(j: JobSubmit, auth: bool = Depends(make_require_scopes({"ba
     }
     await redis.hset(jobkey, mapping=jobdata)
     await redis.zadd(BATCH_ZSET, {job_id: submit_ts})
+    # Clear prior failure on new submission for this model
+    try:
+        await redis.delete(f"model_failure:{j.model}")
+    except Exception:
+        pass
     return {"job_id": job_id}
 
 @v1_router.get("/jobs/{job_id}")
@@ -2015,9 +2109,28 @@ async def batch_planner_loop():
 
                 async def _load_batch_model():
                     try:
+                        # If a preempt abort was requested before starting, exit early
+                        if state.get("load_abort_requested"):
+                            # Requeue claimed jobs
+                            for jid in claimed:
+                                job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                                original_ts = float(job_data.get("submit_ts", now()))
+                                await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
+                                await redis.zadd(BATCH_ZSET, {jid: original_ts})
+                            return False
+
                         # Prefetch model to page cache before evicting realtime
                         log.info("prefetching_batch_model", model=best_model)
                         await prefetch_pagecache_async(best_model)
+
+                        # Check abort again before stopping current runtime
+                        if state.get("load_abort_requested"):
+                            for jid in claimed:
+                                job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                                original_ts = float(job_data.get("submit_ts", now()))
+                                await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
+                                await redis.zadd(BATCH_ZSET, {jid: original_ts})
+                            return False
 
                         # Stop current runtime and start new one
                         log.info("stopping_runtime_for_batch", current_model=state.get("current_model"))
@@ -2027,6 +2140,16 @@ async def batch_planner_loop():
                             await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(best_model))
                         except Exception:
                             # Requeue claimed jobs on failure to start
+                            for jid in claimed:
+                                job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                                original_ts = float(job_data.get("submit_ts", now()))
+                                await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
+                                await redis.zadd(BATCH_ZSET, {jid: original_ts})
+                            return False
+
+                        # If abort requested after starting, stop batch runtime and exit
+                        if state.get("load_abort_requested"):
+                            await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
                             for jid in claimed:
                                 job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
                                 original_ts = float(job_data.get("submit_ts", now()))
@@ -2056,6 +2179,14 @@ async def batch_planner_loop():
                         # Clear loading fields regardless of success
                         state["loading_task"] = None
                         state["loading_model"] = None
+                        # Signal abort completion if requested
+                        if state.get("load_abort_requested"):
+                            ev = state.get("load_abort_done_event")
+                            try:
+                                if isinstance(ev, asyncio.Event) and not ev.is_set():
+                                    ev.set()
+                            except Exception:
+                                pass
 
                 # Create a task to reflect switching state, then await it to proceed
                 state["loading_task"] = asyncio.create_task(_load_batch_model())
@@ -2092,8 +2223,11 @@ async def batch_planner_loop():
             completed_count = 0
             error_count = 0
             requeued_count = 0
+            active_by_eval = {}
+            active_tasks = {}
 
             async def process_batch_job(jid):
+                nonlocal completed_count, error_count, requeued_count
                 # Check for preemption early
                 if state.get("preempt"):
                     job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
@@ -2101,15 +2235,70 @@ async def batch_planner_loop():
                         original_ts = float(job_data.get("submit_ts", now()))
                         await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
                         await redis.zadd(BATCH_ZSET, {jid: original_ts})
-                        nonlocal requeued_count
                         requeued_count += 1
-                    return
+                    return None
                 
                 jobh = await redis.hgetall(JOB_HASH_PREFIX + jid)
                 if not jobh:
-                    return
+                    return None
                 
                 job_type = jobh.get("type", "completion")
+                eval_name_local = jobh.get("eval_name") or None
+
+                async def _call_with_retries(endpoint: str, request_data: dict):
+                    """Call runtime with retries for eval jobs only; returns (result, error_info)."""
+                    max_attempts = 4
+                    base_backoff = 0.5
+                    attempt = 0
+                    last_err = None
+                    while attempt < max_attempts:
+                        try:
+                            res = await runtime_proxy(endpoint, request_data, source="batch")
+                            return res, None
+                        except asyncio.CancelledError:
+                            # Propagate cancellation immediately
+                            raise
+                        except httpx.HTTPStatusError as e:
+                            status = getattr(e, 'response', None).status_code if getattr(e, 'response', None) else None
+                            retry_after = None
+                            try:
+                                if e.response is not None:
+                                    ra = e.response.headers.get('Retry-After')
+                                    if ra:
+                                        retry_after = float(ra)
+                            except Exception:
+                                retry_after = None
+                            # Retry on 429 or 5xx
+                            if status == 429 or (status is not None and status >= 500):
+                                attempt += 1
+                                last_err = ("http_status", status, str(e))
+                                if attempt >= max_attempts:
+                                    break
+                                delay = retry_after if retry_after is not None else (base_backoff * (2 ** (attempt - 1)))
+                                delay += random.uniform(0, 0.2)
+                                await asyncio.sleep(delay)
+                                continue
+                            # Non-retryable 4xx
+                            msg_tail = str(e)[:300]
+                            return None, {"error_type": "http_status", "error_code": status, "error_message": msg_tail, "retry_count": attempt}
+                        except httpx.RequestError as e:
+                            attempt += 1
+                            last_err = ("network_error", None, str(e))
+                            if attempt >= max_attempts:
+                                break
+                            delay = base_backoff * (2 ** (attempt - 1)) + random.uniform(0, 0.2)
+                            await asyncio.sleep(delay)
+                            continue
+                        except Exception as e:
+                            attempt += 1
+                            last_err = ("exception", None, str(e))
+                            if attempt >= max_attempts:
+                                break
+                            delay = base_backoff * (2 ** (attempt - 1)) + random.uniform(0, 0.2)
+                            await asyncio.sleep(delay)
+                            continue
+                    etype, code, msg = last_err if last_err else ("unknown", None, "")
+                    return None, {"error_type": etype, "error_code": code, "error_message": (msg or "")[:300], "retry_count": attempt}
                 try:
                     if job_type == "completion":
                         request_data = {
@@ -2143,7 +2332,22 @@ async def batch_planner_loop():
                             topk = None
                         if topk is not None:
                             request_data["logprobs"] = topk
-                        res = await runtime_proxy("/v1/completions", request_data, source="batch")
+                        res, err = await _call_with_retries("/v1/completions", request_data)
+                        if err is not None:
+                            await redis.hset(JOB_HASH_PREFIX + jid, mapping={
+                                "status": "error",
+                                "error": err.get("error_message", ""),
+                                "error_type": err.get("error_type", ""),
+                                "error_code": str(err.get("error_code")) if err.get("error_code") is not None else "",
+                                "retry_count": str(err.get("retry_count", 0)),
+                                "finished_ts": str(now())
+                            })
+                            error_count += 1
+                            try:
+                                jobs_total.labels(status="error", type=job_type).inc()
+                            except Exception:
+                                pass
+                            return eval_name_local
                     else:
                         request_data = {
                             "model": jobh.get("model", best_model), 
@@ -2169,7 +2373,22 @@ async def batch_planner_loop():
                                 request_data["top_logprobs"] = int(tlp)
                             except Exception:
                                 pass
-                        res = await runtime_proxy("/v1/chat/completions", request_data, source="batch")
+                        res, err = await _call_with_retries("/v1/chat/completions", request_data)
+                        if err is not None:
+                            await redis.hset(JOB_HASH_PREFIX + jid, mapping={
+                                "status": "error",
+                                "error": err.get("error_message", ""),
+                                "error_type": err.get("error_type", ""),
+                                "error_code": str(err.get("error_code")) if err.get("error_code") is not None else "",
+                                "retry_count": str(err.get("retry_count", 0)),
+                                "finished_ts": str(now())
+                            })
+                            error_count += 1
+                            try:
+                                jobs_total.labels(status="error", type=job_type).inc()
+                            except Exception:
+                                pass
+                            return eval_name_local
                     
                     if jobh.get("eval_name"):
                         debug_log = "/tmp/eval_debug.log"
@@ -2185,39 +2404,97 @@ async def batch_planner_loop():
                                 f.write(f"No choices in response: {json.dumps(res)[:500]}\n")
                     
                     await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "completed", "result": json.dumps(res), "finished_ts": str(now())})
-                    nonlocal completed_count
                     completed_count += 1
                     try:
                         jobs_total.labels(status="completed", type=job_type).inc()
                     except Exception:
                         pass
+                    return eval_name_local
+                except asyncio.CancelledError:
+                    # Requeue this in-flight job due to preemption cancellation
+                    try:
+                        jobh2 = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                        if jobh2:
+                            original_ts = float(jobh2.get("submit_ts", now()))
+                            await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
+                            await redis.zadd(BATCH_ZSET, {jid: original_ts})
+                            requeued_count += 1
+                        log.info("job_cancelled_requeued_due_to_preempt", job_id=jid)
+                    except Exception:
+                        pass
+                    return eval_name_local
                 except Exception as e:
                     await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "error", "error": str(e), "finished_ts": str(now())})
-                    nonlocal error_count
                     error_count += 1
                     try:
                         jobs_total.labels(status="error", type=job_type).inc()
                     except Exception:
                         pass
+                    return eval_name_local
 
             # Keep up to MAX_CONCURRENT_BATCH inflight; refill as tasks finish
             seg_t0 = time.time()
             pending = collections.deque(claimed)
             active = set()
+            def _dec_active(eval_name: Optional[str]):
+                if not eval_name:
+                    return
+                active_by_eval[eval_name] = max(0, active_by_eval.get(eval_name, 0) - 1)
+
+            async def _try_schedule_one() -> bool:
+                if not pending:
+                    return False
+                scanned = 0
+                while scanned < len(pending) and len(active) < MAX_CONCURRENT_BATCH and not state.get("preempt"):
+                    jid = pending.popleft()
+                    jobh = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                    eval_name_local = jobh.get("eval_name") if jobh else None
+                    limit = None
+                    if jobh and eval_name_local:
+                        try:
+                            mc = jobh.get("eval_max_concurrency")
+                            if mc is not None and mc != "":
+                                limit = int(mc)
+                        except Exception:
+                            limit = None
+                    if limit is not None and eval_name_local and active_by_eval.get(eval_name_local, 0) >= limit:
+                        pending.append(jid)
+                        scanned += 1
+                        continue
+                    # schedule
+                    if eval_name_local:
+                        active_by_eval[eval_name_local] = active_by_eval.get(eval_name_local, 0) + 1
+                    t = asyncio.create_task(process_batch_job(jid))
+                    def _done_cb(fut, name=eval_name_local):
+                        _dec_active(name)
+                        active_tasks.pop(fut, None)
+                    t.add_done_callback(_done_cb)
+                    active.add(t)
+                    active_tasks[t] = (jid, eval_name_local)
+                    return True
+                return False
+
             # Prime
             while pending and len(active) < MAX_CONCURRENT_BATCH and not state.get("preempt"):
-                jid = pending.popleft()
-                t = asyncio.create_task(process_batch_job(jid))
-                active.add(t)
+                scheduled = await _try_schedule_one()
+                if not scheduled:
+                    break
             # Loop until drained
             while active:
+                # If a preempt drain was requested, cancel all active tasks now
+                if state.get("preempt") and state.get("preempt_drain_requested"):
+                    for t in list(active):
+                        try:
+                            t.cancel()
+                        except Exception:
+                            pass
                 done, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
                 active -= done
                 # Refill
                 while pending and len(active) < MAX_CONCURRENT_BATCH and not state.get("preempt"):
-                    jid = pending.popleft()
-                    t = asyncio.create_task(process_batch_job(jid))
-                    active.add(t)
+                    scheduled = await _try_schedule_one()
+                    if not scheduled:
+                        break
                 # If preempting, requeue not-started jobs
                 if state.get("preempt") and pending:
                     # Requeue not-started jobs
@@ -2229,6 +2506,15 @@ async def batch_planner_loop():
                             await redis.zadd(BATCH_ZSET, {jid: original_ts})
                             requeued_count += 1
                     pending.clear()
+
+                # If drain requested and nothing is active anymore, signal done
+                if not active and state.get("preempt_drain_requested"):
+                    ev = state.get("preempt_drain_done_event")
+                    try:
+                        if isinstance(ev, asyncio.Event) and not ev.is_set():
+                            ev.set()
+                    except Exception:
+                        pass
 
             # After batch work is done, return to realtime model
             try:
@@ -2258,6 +2544,14 @@ async def batch_planner_loop():
             if remaining_jobs == 0:
                 await asyncio.sleep(1.0)
                 remaining_jobs = await redis.zcard(BATCH_ZSET)
+            # If drain requested and we are fully idle (no active segment), also signal done
+            if remaining_jobs == 0 and state.get("preempt_drain_requested"):
+                ev = state.get("preempt_drain_done_event")
+                try:
+                    if isinstance(ev, asyncio.Event) and not ev.is_set():
+                        ev.set()
+                except Exception:
+                    pass
             if remaining_jobs == 0 and state.get("current_model") != REALTIME_MODEL:
                 log.info("no_batch_jobs_remaining_loading_realtime")
                 try:
@@ -2350,13 +2644,15 @@ async def tus_create(
     temp_path = os.path.join(UPLOAD_TEMP_DIR, f"{upload_id}.tar.zst")
     
     # Store upload state in Redis
+    sha256_expected = metadata.get("sha256")
     await redis.hset(f"upload:{upload_id}", mapping={
         "model_name": model_name,
         "size": str(upload_length),
         "offset": "0",
         "temp_path": temp_path,
         "status": "uploading",
-        "created": str(int(now()))
+        "created": str(int(now())),
+        "sha256_expected": sha256_expected or ""
     })
     await redis.expire(f"upload:{upload_id}", 86400)  # 24h TTL
     
@@ -2440,6 +2736,29 @@ async def _finalize_upload(upload_id: str, upload_data: dict):
     model_name = upload_data["model_name"]
     
     try:
+        # Compute SHA256 of uploaded tarball and optionally verify against provided checksum
+        def _sha256_file(path: str, chunk_size: int = 1024 * 1024) -> str:
+            h = hashlib.sha256()
+            with open(path, 'rb') as f:
+                while True:
+                    b = f.read(chunk_size)
+                    if not b:
+                        break
+                    h.update(b)
+            return h.hexdigest()
+        sha256_actual = _sha256_file(temp_path)
+        sha256_expected = upload_data.get("sha256_expected") or ""
+        try:
+            await redis.hset(f"upload:{upload_id}", mapping={"sha256": sha256_actual})
+        except Exception:
+            pass
+        if sha256_expected:
+            if sha256_actual.lower() != sha256_expected.lower():
+                log.error("upload_checksum_mismatch", model=model_name, expected=sha256_expected, actual=sha256_actual)
+                await redis.hset(f"upload:{upload_id}", mapping={"status": "failed", "error": "checksum_mismatch"})
+                raise ValueError("Uploaded file checksum mismatch")
+        log.info("upload_checksum", model=model_name, sha256=sha256_actual, verified=bool(sha256_expected))
+
         # Validate uploaded size matches expectation
         try:
             expected_size = int(upload_data.get("size", "0"))
@@ -2450,7 +2769,7 @@ async def _finalize_upload(upload_id: str, upload_data: dict):
             # Size mismatch or missing; fail fast
             raise
 
-        # Target directory in HF cache format
+        # Target directory in HF cache format (container-side mount path)
         model_dir = f"models--{model_name.replace('/', '--')}"
         target_path = os.path.join(HOST_HF_CACHE, "hub", model_dir, "snapshots", "main")
         
@@ -2575,3 +2894,31 @@ app.include_router(v1_router)
 app.include_router(upload_router)
 app.include_router(eval_router, dependencies=[Depends(make_require_scopes({"eval"}))])  # /eval endpoints
 app.include_router(ui_router)
+async def drop_queued_jobs_for_model(model_id: str, reason: str = "model_failure"):
+    """Remove queued jobs for a model and mark them as error for visibility."""
+    try:
+        queued = await redis.zrange(BATCH_ZSET, 0, -1)
+        dropped = 0
+        for jid in queued:
+            try:
+                h = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                if not h:
+                    continue
+                if h.get("model") != model_id:
+                    continue
+                status = h.get("status")
+                if status not in (None, "queued", "running"):
+                    continue
+                await redis.hset(JOB_HASH_PREFIX + jid, mapping={
+                    "status": "error",
+                    "error": reason,
+                    "finished_ts": str(now())
+                })
+                await redis.zrem(BATCH_ZSET, jid)
+                dropped += 1
+            except Exception:
+                continue
+        if dropped:
+            log.warning("dropped_jobs_for_failed_model", model=model_id, dropped=dropped, reason=reason)
+    except Exception as e:
+        log.error("drop_jobs_failed", model=model_id, error=str(e))

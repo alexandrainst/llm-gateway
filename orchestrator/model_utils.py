@@ -24,7 +24,8 @@ def _ensure_tokenizer_files(model_id: str) -> None:
         from huggingface_hub import snapshot_download
     except Exception:
         return
-    cache_root = os.getenv("HOST_HF_CACHE", "/host_hf_cache")
+    # Always use the container-side mount path for the HF cache
+    cache_root = "/host_hf_cache"
     token = os.getenv("HF_TOKEN")
     # Only fetch tokenizer_config.json; detection relies solely on its chat_template
     allow = [
@@ -56,7 +57,8 @@ def detect_is_base_model(model_id: str) -> bool:
     return True (base) per the simplified rule.
     """
     try:
-        cache_root = os.getenv("HOST_HF_CACHE", "/host_hf_cache")
+        # Always use the container-side mount path for the HF cache
+        cache_root = "/host_hf_cache"
         base_dir = os.path.join(cache_root, "hub", f"models--{model_id.replace('/', '--')}")
         snapshots_dir = os.path.join(base_dir, "snapshots")
         candidates: list[str] = []
