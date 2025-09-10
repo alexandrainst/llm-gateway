@@ -516,17 +516,30 @@ class EvalManager:
                     prepare_result = json.loads(out.decode())
                     requests = prepare_result.get("requests", [])
                     eval_meta = prepare_result.get("metadata", {})
+                    # Extract optional per-eval max concurrency (scalar)
+                    eval_max_conc = None
+                    try:
+                        mc = eval_meta.get("max_concurrency")
+                        if mc is not None:
+                            eval_max_conc = int(mc)
+                    except Exception:
+                        eval_max_conc = None
 
                     completion_ids_local: list[str] = []
                     for request in requests:
                         comp_id = f"comp_{uuid.uuid4().hex[:12]}"
                         request["model"] = model
+                        extra = {
+                            "eval_name": eval_name,
+                            "eval_job_id": job_id,
+                        }
+                        if eval_max_conc is not None:
+                            extra["eval_max_concurrency"] = str(eval_max_conc)
                         job_data = request_to_redis_job(
                             request,
                             model,
                             comp_id,
-                            eval_name=eval_name,
-                            eval_job_id=job_id,
+                            **extra,
                         )
                         await self.redis.hset(f"job:{comp_id}", mapping=job_data)
                         await self.redis.expire(f"job:{comp_id}", 7 * 24 * 3600)
@@ -645,6 +658,7 @@ class EvalManager:
             # Gather all requests and responses using completion IDs as keys
             # This ensures request[i] matches response[i] regardless of completion order
             request_response_pairs = {}
+            http_error_summary = {"total_errors": 0, "by_code": {}, "by_type": {}, "examples": []}
             
             for comp_id in completion_ids:
                 # Get job data from Redis hash (same format as batch endpoints use)
@@ -678,7 +692,27 @@ class EvalManager:
                         else:
                             f.write(f"Response structure issue: {json.dumps(response)[:200]}\n")
                 elif status == "error":
-                    response = {"error": job_data.get("error", "Unknown error")}
+                    # Capture HTTP-layer error info if available
+                    err_msg = job_data.get("error", "Unknown error")
+                    err_code = job_data.get("error_code")
+                    err_type = job_data.get("error_type")
+                    retry_count = job_data.get("retry_count")
+                    response = {"error": err_msg, "error_code": err_code, "error_type": err_type, "retry_count": retry_count}
+                    try:
+                        http_error_summary["total_errors"] += 1
+                        if err_code:
+                            http_error_summary["by_code"][str(err_code)] = http_error_summary["by_code"].get(str(err_code), 0) + 1
+                        if err_type:
+                            http_error_summary["by_type"][str(err_type)] = http_error_summary["by_type"].get(str(err_type), 0) + 1
+                        if len(http_error_summary["examples"]) < 5:
+                            http_error_summary["examples"].append({
+                                "comp_id": comp_id,
+                                "error_code": err_code,
+                                "error_type": err_type,
+                                "message": (err_msg or "")[:200],
+                            })
+                    except Exception:
+                        pass
                 else:
                     response = {"error": f"Job status: {status}"}
                 
@@ -746,6 +780,8 @@ class EvalManager:
             score_result = json.loads(stdout.decode())
             score_result["requests"] = requests
             score_result["responses"] = responses
+            if http_error_summary["total_errors"] > 0:
+                score_result.setdefault("details", {})["http_errors"] = http_error_summary
             return score_result
             
         except Exception as e:
