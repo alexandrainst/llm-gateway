@@ -144,6 +144,21 @@ def main():
         
         try:
             result = eval_module.prepare_requests(model_name, **kwargs)
+            # Attach optional concurrency hint from eval.toml
+            try:
+                eval_config = load_eval_config(eval_name)
+                max_conc = None
+                if eval_config and "eval" in eval_config:
+                    mc = eval_config["eval"].get("max_concurrency")
+                    if mc is not None:
+                        max_conc = int(mc)
+                if max_conc is not None:
+                    if "metadata" not in result or not isinstance(result.get("metadata"), dict):
+                        result["metadata"] = {}
+                    result["metadata"]["max_concurrency"] = max_conc
+            except Exception:
+                # Non-fatal: ignore malformed config and continue
+                pass
             print(json.dumps(result))
         except Exception as e:
             print(f"Error preparing requests: {e}", file=sys.stderr)
