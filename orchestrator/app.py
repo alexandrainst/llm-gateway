@@ -602,11 +602,12 @@ async def send_warmup_request():
         log.warning("warmup_request_error", error=str(e))
 
 async def wait_for_runtime_ready(timeout=600):
+    """Wait until the runtime reports ready. Returns (ok, failure_reason)."""
     kv_tune_attempted = False  # Prevent multiple auto-tune retries per startup
     runtime_host = get_runtime_host()
     deadline = time.time() + timeout
     log.info("waiting_for_runtime", host=runtime_host, port=RUNTIME_PORT, timeout=timeout)
-    
+
     last_container_check = 0
     # Rate-limit HTTP readiness probe logs
     log_interval_s = float(os.getenv("READY_PROBE_LOG_INTERVAL_S", "15"))
@@ -616,7 +617,7 @@ async def wait_for_runtime_ready(timeout=600):
         try:
             if state.get("load_abort_requested"):
                 log.info("runtime_ready_wait_aborted")
-                return False
+                return False, None
         except Exception:
             pass
         # Check container health every 5 seconds
@@ -662,7 +663,10 @@ async def wait_for_runtime_ready(timeout=600):
                     # Exit code 139 = SIGSEGV (segfault)
                     # Exit code 1 = general error
                     
+                    failure_reason = "runtime_crashed"
+
                     if exit_code == 137 or "out of memory" in logs.lower() or "oom" in logs.lower() or "CUDA out of memory" in logs:
+                        failure_reason = "runtime_oom"
                         log.error("runtime_oom", model=model, exit_code=exit_code, logs=logs[-500:])
                         try:
                             if model:
@@ -673,6 +677,7 @@ async def wait_for_runtime_ready(timeout=600):
                         if model:
                             await redis.set(f"model_oom:{model}", str(now()), ex=86400)
                     elif "has no SGlang implementation" in logs or "not compatible with SGLang" in logs:
+                        failure_reason = "model_incompatible"
                         log.error("model_not_supported", model=model, exit_code=exit_code, logs=logs[-500:])
                         try:
                             if model:
@@ -683,6 +688,7 @@ async def wait_for_runtime_ready(timeout=600):
                         if model:
                             await redis.set(f"model_incompatible:{model}", str(now()), ex=2592000)
                     elif exit_code == 139:
+                        failure_reason = "runtime_segfault"
                         log.error("runtime_segfault", model=model, exit_code=exit_code, logs=logs[-500:])
                         try:
                             if model:
@@ -693,6 +699,7 @@ async def wait_for_runtime_ready(timeout=600):
                         if model:
                             await redis.set(f"model_failure:{model}", str(now()), ex=21600)
                     else:
+                        failure_reason = "runtime_crashed"
                         log.error("runtime_crashed", model=model, exit_code=exit_code, logs=logs[-500:])
                         try:
                             if model:
@@ -703,11 +710,11 @@ async def wait_for_runtime_ready(timeout=600):
                         if model:
                             await redis.set(f"model_failure:{model}", str(now()), ex=3600)
                     
-                    return False
+                    return False, failure_reason
             except docker.errors.NotFound:
                 pass
             last_container_check = time.time()
-        
+
         if is_runtime_ready():
             # Try an HTTP check to ensure it's actually responding
             try:
@@ -717,7 +724,7 @@ async def wait_for_runtime_ready(timeout=600):
                         log.info("runtime_ready", host=runtime_host)
                         # Send warmup request to prime the runtime
                         await send_warmup_request()
-                        return True
+                        return True, None
             except Exception as e:
                 now_ts = time.time()
                 if (now_ts - last_http_log) >= log_interval_s or last_http_log == 0.0:
@@ -726,7 +733,7 @@ async def wait_for_runtime_ready(timeout=600):
         await asyncio.sleep(1.0)
     
     log.error("runtime_timeout", host=runtime_host, timeout=timeout)
-    return False
+    return False, "runtime_timeout"
 
 async def http_health_ok(timeout_s: float = 3.0) -> bool:
     """Lightweight HTTP health probe without logging/warmup."""
@@ -1094,12 +1101,14 @@ async def startup():
 async def load_realtime_model_async():
     """Load and warm up the realtime model on startup"""
     try:
-        await prefetch_pagecache_async(REALTIME_MODEL)
+        # Kick off prefetch in the background so it doesn't block startup
+        loop = asyncio.get_running_loop()
+        loop.create_task(prefetch_pagecache_async(REALTIME_MODEL))
         t0 = time.time()
         await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(REALTIME_MODEL))
         # vLLM needs more time to start up
         startup_timeout = VLLM_READY_TIMEOUT_S if RUNTIME_TYPE == "vllm" else DEFAULT_READY_TIMEOUT_S
-        ok = await wait_for_runtime_ready(timeout=startup_timeout)
+        ok, failure_reason = await wait_for_runtime_ready(timeout=startup_timeout)
         if ok:
             state["current_model"] = REALTIME_MODEL
             try:
@@ -1110,6 +1119,8 @@ async def load_realtime_model_async():
             except Exception:
                 pass
             log.info("realtime_model_loaded_on_startup", model=REALTIME_MODEL)
+        elif failure_reason:
+            log.error("realtime_model_failed_to_start", reason=failure_reason)
     except Exception as e:
         log.error("failed_to_load_realtime_on_startup", error=str(e))
 
@@ -1183,12 +1194,13 @@ async def ensure_realtime_model_loading():
             log.warning("preempt_drain_handshake_error", error=str(e))
         try:
             log.info("starting_realtime_model_load", model=REALTIME_MODEL)
-            await prefetch_pagecache_async(REALTIME_MODEL)
+            loop = asyncio.get_running_loop()
+            loop.create_task(prefetch_pagecache_async(REALTIME_MODEL))
             await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
             t0 = time.time()
             await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(REALTIME_MODEL))
             load_timeout = VLLM_READY_TIMEOUT_S if RUNTIME_TYPE == "vllm" else DEFAULT_READY_TIMEOUT_S
-            ok = await wait_for_runtime_ready(timeout=load_timeout)
+            ok, failure_reason = await wait_for_runtime_ready(timeout=load_timeout)
             if ok:
                 prev_model = state.get("current_model")
                 state["current_model"] = REALTIME_MODEL
@@ -1200,6 +1212,8 @@ async def ensure_realtime_model_loading():
                     pass
                 log.info("realtime_model_ready", model=REALTIME_MODEL)
                 state["rt_cooldown_start_ts"] = 0.0
+            elif failure_reason:
+                log.error("realtime_model_load_failed", reason=failure_reason)
         except Exception as e:
             log.error("realtime_model_load_failed", error=str(e))
         finally:
@@ -1263,19 +1277,16 @@ async def ui_summary(auth: bool = Depends(make_require_scopes({"monitor"}))):
     last_age = max(0.0, now() - last_ts) if last_ts > 0 else -1.0
     depth = await redis.zcard(BATCH_ZSET) if redis else 0
 
-    # Sample a subset of queue to build counts per model
-    sample_n = 500
-    queued_ids = await redis.zrange(BATCH_ZSET, 0, sample_n - 1) if redis else []
-    counts: dict[str,int] = {}
-    for jid in queued_ids:
-        h = await redis.hgetall(JOB_HASH_PREFIX + jid)
-        mid = h.get("model") if h else None
-        if mid:
-            counts[mid] = counts.get(mid, 0) + 1
-    queue_by_model = [ {"model": m, "count": c} for m, c in sorted(counts.items(), key=lambda x: x[1], reverse=True) ]
-
-    # Best guess for next/target model based on queue sample
-    next_model = queue_by_model[0]["model"] if queue_by_model else None
+    # Best guess for next/target model based on queue head (if any)
+    next_model = None
+    if redis and depth > 0:
+        try:
+            head = await redis.zrange(BATCH_ZSET, 0, 0)
+            if head:
+                head_job = await redis.hgetall(JOB_HASH_PREFIX + head[0])
+                next_model = head_job.get("model") if head_job else None
+        except Exception:
+            next_model = None
 
     # Loading state
     loading_model = state.get("loading_model")
@@ -1316,7 +1327,6 @@ async def ui_summary(auth: bool = Depends(make_require_scopes({"monitor"}))):
         "lambda_ewma": lam,
         "last_rt_age_s": last_age,
         "queue_depth": depth,
-        "queue_by_model": queue_by_model,
     }
 
 @ui_router.get("/ui/queue")
@@ -1441,48 +1451,96 @@ async def ui_eval_matrix(auth: bool = Depends(make_require_scopes({"monitor"})))
     columns: dict[str, dict] = {}  # key -> {label, metrics_set:set}
     rows_map: dict[str, dict] = {}  # model -> {col_key -> {metric->value}}
 
+    def _iter_jsonl_tail(path: Path, block_size: int = 1024 * 1024):
+        try:
+            with open(path, 'rb') as f:
+                f.seek(0, os.SEEK_END)
+                pos = f.tell()
+                leftover = b''
+                while pos > 0:
+                    step = min(block_size, pos)
+                    pos -= step
+                    f.seek(pos)
+                    chunk = f.read(step)
+                    data = chunk + leftover
+                    lines = data.split(b"\n")
+                    leftover = lines[0]
+                    # yield full lines from end to start
+                    for ln in reversed(lines[1:]):
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        try:
+                            yield ln.decode('utf-8', errors='ignore')
+                        except Exception:
+                            continue
+                # any remaining line at start
+                if leftover and leftover.strip():
+                    try:
+                        yield leftover.decode('utf-8', errors='ignore')
+                    except Exception:
+                        pass
+        except Exception:
+            return
+
     for model_dir in base.iterdir():
         if not model_dir.is_dir():
             continue
-        # Resolve latest
-        latest_dir = None
-        latest_link = model_dir / "latest"
-        try:
-            if latest_link.exists():
-                latest_dir = latest_link.resolve()
-        except Exception:
+        # Prefer consolidated JSONL with history; pick the latest per eval_name by scanning tail-first
+        jsonl = model_dir / "results.jsonl"
+        latest_by_eval: dict[str, dict] = {}
+        if jsonl.exists():
+            for line in _iter_jsonl_tail(jsonl):
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                ev = entry.get("eval_name")
+                if not ev or ev in latest_by_eval:
+                    # already have latest for this eval
+                    continue
+                latest_by_eval[ev] = entry
+                # Optional stop condition if file is huge: if we collected many evals
+                if len(latest_by_eval) >= 200:
+                    break
+        
+        if not latest_by_eval:
+            # Fallback to previous behavior: look at latest job directory
             latest_dir = None
-        if latest_dir is None or not latest_dir.exists():
-            # Fallback: pick most recent timestamp directory
-            subdirs = [d for d in model_dir.iterdir() if d.is_dir()]
-            if not subdirs:
-                continue
-            latest_dir = sorted(subdirs)[-1]
-
-        # Load all *_results.json
-        for f in latest_dir.glob("*_results.json"):
+            latest_link = model_dir / "latest"
             try:
-                with open(f, "r") as fh:
-                    data = json.load(fh)
+                if latest_link.exists():
+                    latest_dir = latest_link.resolve()
             except Exception:
-                continue
+                latest_dir = None
+            if latest_dir is None or not latest_dir.exists():
+                subdirs = [d for d in model_dir.iterdir() if d.is_dir()]
+                if not subdirs:
+                    continue
+                latest_dir = sorted(subdirs)[-1]
+            for f in latest_dir.glob("*_results.json"):
+                try:
+                    with open(f, "r") as fh:
+                        data = json.load(fh)
+                    ev = data.get("eval_name") or f.stem.replace("_results", "")
+                    latest_by_eval[ev] = data
+                except Exception:
+                    continue
+
+        # Now aggregate latest_by_eval into matrix rows/columns
+        for ev, data in latest_by_eval.items():
             model_name = data.get("model") or model_dir.name
-            eval_name = data.get("eval_name", "")
             metrics = data.get("metrics", {}) or {}
             if not isinstance(metrics, dict) or not metrics:
                 continue
-
-            # Ensure row exists
             rows_map.setdefault(model_name, {})
 
-            if eval_name == "euroeval":
-                # Expand dataset-prefixed metrics: <dataset>_<metric>
+            if ev == "euroeval":
                 by_ds: dict[str, dict] = {}
                 for k, v in metrics.items():
                     if not isinstance(v, (int, float)):
                         continue
                     if "_" not in k:
-                        # Skip non-dataset metrics for matrix
                         continue
                     ds, m = k.split("_", 1)
                     if not ds:
@@ -1493,13 +1551,29 @@ async def ui_eval_matrix(auth: bool = Depends(make_require_scopes({"monitor"})))
                     col_label = f"euroeval • {ds}"
                     c = columns.setdefault(col_key, {"label": col_label, "metrics_set": set()})
                     c["metrics_set"].update(list(mvals.keys()))
-                    # Store row values
+                    rows_map[model_name].setdefault(col_key, {})
+                    rows_map[model_name][col_key].update(mvals)
+            elif ev == "lm-harness":
+                by_task: dict[str, dict] = {}
+                for k, v in metrics.items():
+                    if not isinstance(v, (int, float)):
+                        continue
+                    if ":" not in k:
+                        continue
+                    task, m = k.split(":", 1)
+                    if not task:
+                        continue
+                    by_task.setdefault(task, {})[m] = v
+                for task, mvals in by_task.items():
+                    col_key = f"lm-harness:{task}"
+                    col_label = f"lm-harness • {task}"
+                    c = columns.setdefault(col_key, {"label": col_label, "metrics_set": set()})
+                    c["metrics_set"].update(list(mvals.keys()))
                     rows_map[model_name].setdefault(col_key, {})
                     rows_map[model_name][col_key].update(mvals)
             else:
-                # Flat eval
-                col_key = eval_name or f.name.replace("_results.json", "")
-                col_label = eval_name or col_key
+                col_key = ev
+                col_label = ev
                 numeric = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
                 if not numeric:
                     continue
@@ -2108,16 +2182,22 @@ async def batch_planner_loop():
                 state["loading_model"] = best_model
 
                 async def _load_batch_model():
+                    failure_reason = None
+
+                    async def _requeue_claimed_jobs():
+                        for jid in claimed:
+                            job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
+                            if not job_data:
+                                continue
+                            original_ts = float(job_data.get("submit_ts", now()))
+                            await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
+                            await redis.zadd(BATCH_ZSET, {jid: original_ts})
+
                     try:
                         # If a preempt abort was requested before starting, exit early
                         if state.get("load_abort_requested"):
-                            # Requeue claimed jobs
-                            for jid in claimed:
-                                job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
-                                original_ts = float(job_data.get("submit_ts", now()))
-                                await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
-                                await redis.zadd(BATCH_ZSET, {jid: original_ts})
-                            return False
+                            await _requeue_claimed_jobs()
+                            return False, None
 
                         # Prefetch model to page cache before evicting realtime
                         log.info("prefetching_batch_model", model=best_model)
@@ -2125,46 +2205,41 @@ async def batch_planner_loop():
 
                         # Check abort again before stopping current runtime
                         if state.get("load_abort_requested"):
-                            for jid in claimed:
-                                job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
-                                original_ts = float(job_data.get("submit_ts", now()))
-                                await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
-                                await redis.zadd(BATCH_ZSET, {jid: original_ts})
-                            return False
+                            await _requeue_claimed_jobs()
+                            return False, None
 
                         # Stop current runtime and start new one
+                        loop = asyncio.get_running_loop()
                         log.info("stopping_runtime_for_batch", current_model=state.get("current_model"))
-                        await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
+                        await loop.run_in_executor(None, stop_runtime_container_sync)
+
+                        t0 = time.time()
                         try:
-                            t0 = time.time()
-                            await asyncio.get_running_loop().run_in_executor(None, lambda: start_runtime_container_sync(best_model))
+                            started = await loop.run_in_executor(
+                                None, lambda: start_runtime_container_sync(best_model)
+                            )
                         except Exception:
-                            # Requeue claimed jobs on failure to start
-                            for jid in claimed:
-                                job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
-                                original_ts = float(job_data.get("submit_ts", now()))
-                                await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
-                                await redis.zadd(BATCH_ZSET, {jid: original_ts})
-                            return False
+                            failure_reason = "runtime_start_exception"
+                            await _requeue_claimed_jobs()
+                            return False, failure_reason
+
+                        if started is None:
+                            failure_reason = "runtime_start_failed"
+                            await _requeue_claimed_jobs()
+                            return False, failure_reason
 
                         # If abort requested after starting, stop batch runtime and exit
                         if state.get("load_abort_requested"):
                             await asyncio.get_running_loop().run_in_executor(None, stop_runtime_container_sync)
-                            for jid in claimed:
-                                job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
-                                original_ts = float(job_data.get("submit_ts", now()))
-                                await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
-                                await redis.zadd(BATCH_ZSET, {jid: original_ts})
-                            return False
+                            await _requeue_claimed_jobs()
+                            return False, None
 
-                        ok = await wait_for_runtime_ready(timeout=900)
+                        ok, failure_reason = await wait_for_runtime_ready(timeout=900)
                         if not ok:
-                            for jid in claimed:
-                                job_data = await redis.hgetall(JOB_HASH_PREFIX + jid)
-                                original_ts = float(job_data.get("submit_ts", now()))
-                                await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "queued"})
-                                await redis.zadd(BATCH_ZSET, {jid: original_ts})
-                            return False
+                            await _requeue_claimed_jobs()
+                            if not failure_reason:
+                                failure_reason = "runtime_not_ready"
+                            return False, failure_reason
 
                         prev_model = state.get("current_model")
                         state["current_model"] = best_model
@@ -2174,7 +2249,7 @@ async def batch_planner_loop():
                                 model_switches.inc()
                         except Exception:
                             pass
-                        return True
+                        return True, None
                     finally:
                         # Clear loading fields regardless of success
                         state["loading_task"] = None
@@ -2190,8 +2265,13 @@ async def batch_planner_loop():
 
                 # Create a task to reflect switching state, then await it to proceed
                 state["loading_task"] = asyncio.create_task(_load_batch_model())
-                ok_switch = await state["loading_task"]
+                ok_switch, failure_reason = await state["loading_task"]
                 if not ok_switch:
+                    if failure_reason:
+                        try:
+                            await drop_queued_jobs_for_model(best_model, reason=failure_reason)
+                        except Exception as e:
+                            log.error("drop_jobs_after_start_failure_error", model=best_model, error=str(e))
                     await asyncio.sleep(1.0)
                     continue
             else:
@@ -2316,6 +2396,13 @@ async def batch_planner_loop():
                                 request_data["stop"] = stop_val
                         except Exception:
                             pass
+                        # Optional: echo (needed for prompt logprobs when max_tokens=0)
+                        ech = jobh.get("echo")
+                        if ech is not None and ech != "":
+                            try:
+                                request_data["echo"] = True if ech in ("1", "true", "True") else False
+                            except Exception:
+                                pass
                         # Optional: logprobs/top_logprobs (vLLM completions expects integer logprobs)
                         lp = jobh.get("logprobs")
                         tlp = jobh.get("top_logprobs")
