@@ -174,8 +174,15 @@ def prepare_requests(model_name: str, **kwargs) -> Dict[str, Any]:
                                 "_dataset": dataset,  # Track which dataset this request is from
                             }
                         
-                        # Add other generation kwargs if present
-                        for key in ["top_p", "frequency_penalty", "presence_penalty", "stop"]:
+                        # Add other generation kwargs if present (include logprobs)
+                        for key in [
+                            "top_p",
+                            "frequency_penalty",
+                            "presence_penalty",
+                            "stop",
+                            "logprobs",
+                            "top_logprobs",
+                        ]:
                             if key in request_data["generation_kwargs"]:
                                 formatted_request[key] = request_data["generation_kwargs"][key]
                         
