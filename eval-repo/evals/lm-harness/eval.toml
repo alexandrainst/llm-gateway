@@ -1,0 +1,19 @@
+[eval]
+tasks = ["ai2_arc", "mmlu_pro", "squad_completion", "triviaqa"]
+limit = 0
+logprobs_top_k = 5
+fewshot_seed = 1234
+max_concurrency = 128
+
+[task.ai2_arc]
+num_fewshot = 0
+
+[task.mmlu_pro]
+num_fewshot = 5
+
+[task.squad_completion]
+num_fewshot = 0
+
+[task.triviaqa]
+num_fewshot = 0
+requires_instruction_model = false
