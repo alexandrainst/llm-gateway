@@ -1,4 +1,4 @@
 {
-  "default_evals": ["ifeval-da", "euroeval", "RULER-da"],
+  "default_evals": ["ifeval-da", "euroeval", "RULER-da", "lm-harness"],
   "_disabled_evals": ["example_eval"]
 }

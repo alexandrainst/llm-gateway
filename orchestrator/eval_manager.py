@@ -249,15 +249,27 @@ def request_to_redis_job(request: Dict[str, Any], model: str, comp_id: str, **ex
     job_data["n"] = str(request.get("n", 1))
     job_data["stop"] = json.dumps(request.get("stop"))
     job_data["priority"] = str(request.get("priority", 0))
-    # Optional: logprobs/top_logprobs for classification label extraction
+    # Optional: logprobs/top_logprobs for scoring
+    # Preserve integer top-K if provided; else coerce boolean to "1"/"0"
     if "logprobs" in request and request["logprobs"] is not None:
-        job_data["logprobs"] = "1" if bool(request.get("logprobs")) else "0"
+        lp_val = request.get("logprobs")
+        try:
+            # Prefer integer K for completions API compatibility
+            if isinstance(lp_val, int):
+                job_data["logprobs"] = str(int(lp_val))
+            else:
+                job_data["logprobs"] = "1" if bool(lp_val) else "0"
+        except Exception:
+            job_data["logprobs"] = "1" if bool(lp_val) else "0"
     if "top_logprobs" in request and request["top_logprobs"] is not None:
         try:
             job_data["top_logprobs"] = str(int(request.get("top_logprobs")))
         except Exception:
             # Ignore malformed values
             pass
+    # Optional: echo (needed for prompt logprobs when max_tokens=0)
+    if "echo" in request and request["echo"] is not None:
+        job_data["echo"] = "1" if bool(request.get("echo")) else "0"
     
     return job_data
 
@@ -293,7 +305,8 @@ def redis_job_to_request(job_data: Dict[str, str]) -> Dict[str, Any]:
     lp = job_data.get("logprobs")
     if lp is not None and lp != "":
         try:
-            request["logprobs"] = True if lp in ("1", "true", "True") else False
+            # If numeric string, return int top-K; otherwise boolean
+            request["logprobs"] = int(lp) if lp.isdigit() else (True if lp in ("1", "true", "True") else False)
         except Exception:
             pass
     tlp = job_data.get("top_logprobs")
@@ -302,7 +315,14 @@ def redis_job_to_request(job_data: Dict[str, str]) -> Dict[str, Any]:
             request["top_logprobs"] = int(tlp)
         except Exception:
             pass
-    
+    # Optional echo
+    ech = job_data.get("echo")
+    if ech is not None and ech != "":
+        try:
+            request["echo"] = True if ech in ("1", "true", "True") else False
+        except Exception:
+            pass
+
     return request
 
 
@@ -328,7 +348,7 @@ class EvalManager:
         # Track active evaluations
         self.active_evals: Dict[str, asyncio.Task] = {}
     
-    async def submit_eval(self, model: str) -> str:
+    async def submit_eval(self, model: str, evals: List[str] | None = None, prepare_args: Dict | None = None) -> str:
         """
         Submit a model for evaluation.
         
@@ -348,7 +368,10 @@ class EvalManager:
             "created_at": datetime.utcnow().isoformat(),
             "eval_status": {},
             "completion_ids": [],
-            "eval_groups": {}
+            "eval_groups": {},
+            # Optional overrides
+            "requested_evals": evals or [],
+            "prepare_args": prepare_args or {},
         }
         
         # Store in Redis with 30 day TTL
@@ -431,31 +454,41 @@ class EvalManager:
         
         Returns dict with completion_ids, eval_groups, and metadata.
         """
+        # Load overrides from job record if present
+        try:
+            job_raw = await self.redis.get(f"eval_job:{job_id}")
+            job_cfg = json.loads(job_raw) if job_raw else {}
+            requested_evals = job_cfg.get("requested_evals") or []
+            prepare_args = job_cfg.get("prepare_args") or {}
+        except Exception:
+            requested_evals = []
+            prepare_args = {}
         # Check if model is a base model
         is_base_model = await self._check_is_base_model(model)
         
-        # Ask eval repo which evals to run, passing base model flag
-        list_cmd = ["python", f"{self.eval_repo_path}/run_eval.py", "list"]
-        if is_base_model:
-            list_cmd.append("--base-model")
-        
-        try:
-            result = await asyncio.create_subprocess_exec(
-                *list_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            stdout, stderr = await result.communicate()
-            
-            if result.returncode != 0:
-                logger.error(f"Failed to list evals: {stderr.decode()}")
-                eval_names = ["example_eval"]  # Fallback
-            else:
-                list_result = json.loads(stdout.decode())
-                eval_names = list_result.get("evals", ["example_eval"])
-        except Exception as e:
-            logger.error(f"Error getting eval list: {e}")
-            eval_names = ["example_eval"]  # Fallback
+        # Determine evals to run: overrides or defaults from repo list
+        if requested_evals:
+            eval_names = [str(e) for e in requested_evals]
+        else:
+            list_cmd = ["python", f"{self.eval_repo_path}/run_eval.py", "list"]
+            if is_base_model:
+                list_cmd.append("--base-model")
+            try:
+                result = await asyncio.create_subprocess_exec(
+                    *list_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                stdout, stderr = await result.communicate()
+                if result.returncode != 0:
+                    logger.error(f"Failed to list evals: {stderr.decode()}")
+                    eval_names = ["example_eval"]
+                else:
+                    list_result = json.loads(stdout.decode())
+                    eval_names = list_result.get("evals", ["example_eval"])
+            except Exception as e:
+                logger.error(f"Error getting eval list: {e}")
+                eval_names = ["example_eval"]
         
         logger.info(f"Running evals: {eval_names}")
         
@@ -479,6 +512,13 @@ class EvalManager:
                     ]
                     if is_base_model:
                         cmd_args.append("--base-model")
+                    # Optional: apply prepare_args (support max_prompts)
+                    try:
+                        mp = prepare_args.get("max_prompts")
+                        if mp is not None:
+                            cmd_args.extend(["--max-prompts", str(int(mp))])
+                    except Exception:
+                        pass
 
                     rc, out, err = await run_eval_command(eval_name, self.eval_repo_path, cmd_args)
                     if rc != 0:
@@ -1043,18 +1083,36 @@ async def submit_evaluation(
     request: Request,
     eval_manager: EvalManager = Depends(get_eval_manager)
 ):
-    """Submit a model for evaluation."""
+    """Submit a model for evaluation.
+    Optional overrides:
+      - evals: list[str] of eval module names to run
+      - prepare_args: dict of adapter-specific prepare flags (e.g., {"max_prompts": 50})
+    """
     model = request_body.get("model")
     if not model:
         raise HTTPException(status_code=400, detail="Model name required")
+    # Parse optional overrides
+    evals = request_body.get("evals") or []
+    if evals and not isinstance(evals, list):
+        raise HTTPException(status_code=400, detail="'evals' must be a list of strings")
+    try:
+        evals = [str(x) for x in (evals or [])]
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid 'evals' list")
+    prepare_args = request_body.get("prepare_args") or {}
+    if prepare_args and not isinstance(prepare_args, dict):
+        raise HTTPException(status_code=400, detail="'prepare_args' must be an object")
+
     # Submit evaluation job
-    job_id = await eval_manager.submit_eval(model)
-    
+    job_id = await eval_manager.submit_eval(model, evals=evals, prepare_args=prepare_args)
+
     return {
         "job_id": job_id,
         "model": model,
         "status": "submitted",
-        "message": f"Evaluation job {job_id} submitted successfully"
+        "message": f"Evaluation job {job_id} submitted successfully",
+        "requested_evals": evals,
+        "prepare_args": prepare_args,
     }
 
 

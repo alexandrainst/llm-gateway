@@ -8,7 +8,7 @@
     body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #0b0f14; color: #e7eef5; max-width: 100vw; overflow-x: hidden; }
     h1 { margin: 0 0 12px 0; font-size: 20px; }
     .row { display: flex; flex-wrap: wrap; gap: 12px; }
-    .card { background: #121822; border: 1px solid #1e2733; border-radius: 8px; padding: 12px; flex: 1 1 320px; }
+    .card { background: #121822; border: 1px solid #1e2733; border-radius: 8px; padding: 12px; flex: 1 1 320px; min-width: 0; }
     .kvs { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: center; }
     .k { color: #9fb0c3; }
     table { width: 100%; border-collapse: collapse; }
@@ -107,17 +107,6 @@
           logEl.textContent = logs.text || '';
           logEl.scrollTop = logEl.scrollHeight;
         }
-
-        // Queue by model (sampled)
-        const tbody = document.getElementById('queueByModel');
-        tbody.innerHTML = '';
-        sum.queue_by_model.forEach(row => {
-          const tr = document.createElement('tr');
-          tr.innerHTML = `<td>${row.model}</td><td>${row.count}</td>`;
-          tbody.appendChild(tr);
-        });
-
-        // Removed queued jobs sample table (noisy, not very useful)
 
         // Eval results matrix
         const nonEmptyCols = new Set();
@@ -343,32 +332,12 @@
 
 
   <div class="row" style="margin-top:12px;">
-    <div class="card">
-      <h3>Queue by Model (sampled)</h3>
-      <table>
-        <thead><tr><th>Model</th><th>Queued</th></tr></thead>
-        <tbody id="queueByModel"></tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="row" style="margin-top:12px;">
     <div class="card" style="flex:1 1 100%">
       <h3>Runtime Logs <span class="muted" style="font-weight:normal">(status: <span id="logStatus"></span>)</span></h3>
       <div style="margin-bottom:6px">
         <label><input type="checkbox" id="pauseLogs"> Pause auto-refresh</label>
       </div>
       <pre id="runtimeLogs" style="height:240px; overflow-y:auto; background:#0b0f14; border:1px solid #1e2733; padding:8px; border-radius:6px; white-space:pre-wrap;"></pre>
-    </div>
-  </div>
-
-  <div class="row" style="margin-top:12px;">
-    <div class="card" style="flex:1 1 100%">
-      <h3>Recent Evaluation Jobs</h3>
-      <table>
-        <thead><tr><th>Job ID</th><th>Model</th><th>Status</th><th>Created</th></tr></thead>
-        <tbody id="evalTable"></tbody>
-      </table>
     </div>
   </div>
 
