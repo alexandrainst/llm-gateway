@@ -63,6 +63,17 @@ def load_eval_module(eval_name: str):
     return module
 
 
+def eval_module_available(eval_name: str) -> bool:
+    eval_path = Path(__file__).parent / "evals" / eval_name
+    if not eval_path.exists():
+        return False
+    if (eval_path / "eval.py").exists():
+        return True
+    if (eval_path / "__init__.py").exists():
+        return True
+    return False
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python run_eval.py <action> [args...]", file=sys.stderr)
@@ -100,7 +111,10 @@ def main():
             evals = filtered_evals
         else:
             evals = all_evals
-        
+
+        # Drop evals whose code is not available so downstream prepare doesn't fail
+        evals = [name for name in evals if eval_module_available(name)]
+
         print(json.dumps({"evals": evals}))
         return
     
@@ -161,7 +175,12 @@ def main():
                 pass
             print(json.dumps(result))
         except Exception as e:
-            print(f"Error preparing requests: {e}", file=sys.stderr)
+            err_msg = str(e).strip()
+            if not err_msg:
+                err_msg = repr(e)
+            print(f"Error preparing requests: {err_msg}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
             sys.exit(1)
     
     elif action == "score":
