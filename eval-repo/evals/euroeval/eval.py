@@ -23,6 +23,29 @@ except Exception:  # pragma: no cover
 # Disable tqdm progress bars in non-interactive environments
 os.environ["TQDM_DISABLE"] = "1"
 
+# Debug log location (default to working tree so host can inspect it)
+# Prefer an explicit path; otherwise write into the eval directory (which is bind-mounted)
+DEFAULT_DEBUG_BASENAME = "euroeval_debug.log"
+_default_target = Path.cwd() / DEFAULT_DEBUG_BASENAME
+# If cwd is read-only (e.g. /app inside container), fall back to /tmp
+if not os.access(_default_target.parent, os.W_OK):
+    _default_target = Path("/tmp") / DEFAULT_DEBUG_BASENAME
+DEBUG_LOG_PATH = Path(os.getenv("EUROEVAL_DEBUG_LOG", _default_target))
+
+
+def _write_debug(message: str) -> None:
+    """Append a line to the EuroEval debug log, creating directories if needed."""
+    try:
+        DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with DEBUG_LOG_PATH.open("a", encoding="utf-8") as log:
+            log.write(message)
+    except OSError:
+        # As a last resort, fall back to /tmp
+        fallback = Path("/tmp") / DEFAULT_DEBUG_BASENAME
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        with fallback.open("a", encoding="utf-8") as log:
+            log.write(message)
+
 # Add EuroEval to path
 euroeval_path = Path(__file__).parent.parent.parent.parent / "EuroEval" / "src"
 sys.path.insert(0, str(euroeval_path))
@@ -73,20 +96,20 @@ def prepare_requests(model_name: str, **kwargs) -> Dict[str, Any]:
         few_shot = True if is_base_model else False
     
     # Debug logging
-    with open("/tmp/euroeval_debug.log", "a") as log:
-        log.write(f"\n[PREPARE_REQUESTS] Starting phase 1\n")
-        log.write(f"  - Model: {model_name}\n")
-        log.write(f"  - Datasets: {datasets}\n")
-        log.write(f"  - Is base model: {is_base_model}\n")
-        log.write(f"  - Few-shot: {few_shot} (base={is_base_model}, instruct={not is_base_model})\n")
+    _write_debug("\n[PREPARE_REQUESTS] Starting phase 1\n")
+    _write_debug(f"  - Model: {model_name}\n")
+    _write_debug(f"  - Datasets: {datasets}\n")
+    _write_debug(f"  - Is base model: {is_base_model}\n")
+    _write_debug(
+        f"  - Few-shot: {few_shot} (base={is_base_model}, instruct={not is_base_model})\n"
+    )
     
     # Collect requests from all datasets
     all_requests = []
     dataset_metadata = {}
     
     for dataset in datasets:
-        with open("/tmp/euroeval_debug.log", "a") as log:
-            log.write(f"\n[PREPARE_REQUESTS] Processing dataset: {dataset}\n")
+        _write_debug(f"\n[PREPARE_REQUESTS] Processing dataset: {dataset}\n")
         
         # Create temporary file for request collection for this dataset
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
@@ -98,9 +121,10 @@ def prepare_requests(model_name: str, **kwargs) -> Dict[str, Any]:
             os.environ["EUROEVAL_GATEWAY_REQUESTS_FILE"] = requests_file
             
             # Debug: log that we're setting the environment
-            with open("/tmp/euroeval_debug.log", "a") as log:
-                log.write(f"\n[PREPARE_REQUESTS] Set EUROEVAL_GATEWAY_MODE=phase1\n")
-                log.write(f"[PREPARE_REQUESTS] Set EUROEVAL_GATEWAY_REQUESTS_FILE={requests_file}\n")
+            _write_debug("\n[PREPARE_REQUESTS] Set EUROEVAL_GATEWAY_MODE=phase1\n")
+            _write_debug(
+                f"[PREPARE_REQUESTS] Set EUROEVAL_GATEWAY_REQUESTS_FILE={requests_file}\n"
+            )
             
             # Set base model flag if provided
             if is_base_model:
@@ -116,33 +140,40 @@ def prepare_requests(model_name: str, **kwargs) -> Dict[str, Any]:
                 verbose=False,
                 num_iterations=1,
                 force=True,
-                raise_errors=False,
+                raise_errors=True,
                 is_base_model=kwargs.get("is_base_model", False),
                 evaluate_test_split=evaluate_test_split,
                 few_shot=few_shot
             )
             
             # Run benchmarker to collect requests
-            with open("/tmp/euroeval_debug.log", "a") as log:
-                log.write(f"[PREPARE_REQUESTS] Running benchmarker.benchmark() for {dataset}...\n")
+            _write_debug(
+                f"[PREPARE_REQUESTS] Running benchmarker.benchmark() for {dataset}...\n"
+            )
             
             try:
                 # Pass the actual model name - our gateway module will use it
                 results = benchmarker.benchmark(model=[model_name])
-                with open("/tmp/euroeval_debug.log", "a") as log:
-                    log.write(f"[PREPARE_REQUESTS] Benchmark returned {len(results) if results else 0} results for {dataset}\n")
+                _write_debug(
+                    f"[PREPARE_REQUESTS] Benchmark returned {len(results) if results else 0} results for {dataset}\n"
+                )
             except Exception as e:
-                # Log the full exception with traceback
+                # Log the full exception with traceback, then surface the failure
                 import traceback
-                with open("/tmp/euroeval_debug.log", "a") as log:
-                    log.write(f"[PREPARE_REQUESTS] Benchmark failed for {dataset} with error: {str(e)}\n")
-                    log.write(f"[PREPARE_REQUESTS] Traceback:\n{traceback.format_exc()}\n")
+                _write_debug(
+                    f"[PREPARE_REQUESTS] Benchmark failed for {dataset} with error: {str(e)}\n"
+                )
+                _write_debug(
+                    f"[PREPARE_REQUESTS] Traceback:\n{traceback.format_exc()}\n"
+                )
+                raise
             
             # Read collected requests for this dataset
             dataset_requests = []
             if Path(requests_file).exists():
-                with open("/tmp/euroeval_debug.log", "a") as log:
-                    log.write(f"[PREPARE_REQUESTS] Reading requests from {requests_file} for {dataset}\n")
+                _write_debug(
+                    f"[PREPARE_REQUESTS] Reading requests from {requests_file} for {dataset}\n"
+                )
                 
                 with open(requests_file, 'r') as f:
                     for line in f:
@@ -188,8 +219,9 @@ def prepare_requests(model_name: str, **kwargs) -> Dict[str, Any]:
                         
                         dataset_requests.append(formatted_request)
             
-            with open("/tmp/euroeval_debug.log", "a") as log:
-                log.write(f"[PREPARE_REQUESTS] Collected {len(dataset_requests)} requests from {dataset}\n")
+            _write_debug(
+                f"[PREPARE_REQUESTS] Collected {len(dataset_requests)} requests from {dataset}\n"
+            )
             
             # Track metadata for this dataset
             dataset_metadata[dataset] = {
@@ -214,8 +246,9 @@ def prepare_requests(model_name: str, **kwargs) -> Dict[str, Any]:
     if "EUROEVAL_IS_BASE_MODEL" in os.environ:
         del os.environ["EUROEVAL_IS_BASE_MODEL"]
     
-    with open("/tmp/euroeval_debug.log", "a") as log:
-        log.write(f"\n[PREPARE_REQUESTS] Total collected: {len(all_requests)} requests from {len(datasets)} datasets\n")
+    _write_debug(
+        f"\n[PREPARE_REQUESTS] Total collected: {len(all_requests)} requests from {len(datasets)} datasets\n"
+    )
     
     # Return in protocol format
     return {
