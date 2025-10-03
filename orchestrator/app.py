@@ -2,7 +2,7 @@
 import os, time, uuid, json, asyncio, subprocess, socket, collections, math, re, random, hashlib
 import shutil
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional, Union, Any
 from fastapi import FastAPI, HTTPException, Response, Depends, APIRouter, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -78,6 +78,45 @@ state = {
     "last_warmup_ts": 0.0,
     "rt_cooldown_start_ts": 0.0,
 }
+
+
+def _looks_like_runtime_oom(exit_code: int, logs: str, *, oom_killed: bool = False) -> bool:
+    """Determine if a failure likely stems from an OOM condition."""
+    if oom_killed:
+        return True
+    if exit_code == 137:  # SIGKILL (can be OOM or manual kill)
+        # Require log corroboration to avoid false positives when we stop containers ourselves.
+        if not logs:
+            return False
+    elif not logs:
+        return False
+    lowered = logs.lower()
+    oom_markers = (
+        "cuda out of memory",
+        "out of memory",
+        "resource exhausted",
+        "hip error out of memory",
+    )
+    return any(marker in lowered for marker in oom_markers)
+
+
+def persist_runtime_failure_log(model: Optional[str], reason: str, logs: str) -> Optional[str]:
+    """Persist recent runtime logs for postmortem analysis."""
+    if not logs:
+        return None
+    model_id = model or "unknown_model"
+    safe_model = re.sub(r"[^A-Za-z0-9._-]", "_", model_id)
+    safe_reason = re.sub(r"[^A-Za-z0-9._-]", "_", reason or "unknown_reason")
+    timestamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    base_dir = Path(os.getenv("RUNTIME_FAILURE_LOG_DIR", "/host_hf_cache/runtime_failures"))
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+        log_path = base_dir / f"{timestamp}_{safe_model}_{safe_reason}.log"
+        log_path.write_text(logs, encoding="utf-8", errors="ignore")
+        return str(log_path)
+    except Exception as exc:
+        log.warning("runtime_failure_log_write_failed", error=str(exc))
+        return None
 
 # -------- Reduce access log noise (healthz and UI polling) --------
 class _AccessFilter(logging.Filter):
@@ -198,7 +237,10 @@ class CompletionRequest(BaseModel):
     # For vLLM Completions, logprobs should be an integer top-K
     logprobs: Optional[Union[int, bool]] = None
     top_logprobs: Optional[int] = None
-    
+    response_format: Optional[dict] = None
+    # vLLM passthrough for additional sampling params (e.g., guided_* for structured outputs)
+    extra_body: Optional[Dict[str, Any]] = None
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[dict]
@@ -212,6 +254,9 @@ class ChatCompletionRequest(BaseModel):
     # vLLM Chat expects logprobs: bool and top_logprobs: int
     logprobs: Optional[bool] = None
     top_logprobs: Optional[int] = None
+    response_format: Optional[dict] = None
+    # vLLM passthrough for additional sampling params (e.g., guided_* for structured outputs)
+    extra_body: Optional[Dict[str, Any]] = None
 
 class JobSubmit(BaseModel):
     model: str  # Changed from model_id for consistency
@@ -230,7 +275,11 @@ class BatchCompletionRequest(BaseModel):
     stop: list[str] = None
     # Batch-specific fields
     priority: int = 1
-    
+    logprobs: Optional[Union[int, bool]] = None
+    top_logprobs: Optional[int] = None
+    response_format: Optional[dict] = None
+    extra_body: Optional[Dict[str, Any]] = None
+
 class BatchChatCompletionRequest(BaseModel):
     model: str
     messages: list[dict]
@@ -242,6 +291,10 @@ class BatchChatCompletionRequest(BaseModel):
     stop: list[str] = None
     # Batch-specific fields
     priority: int = 1
+    logprobs: Optional[bool] = None
+    top_logprobs: Optional[int] = None
+    response_format: Optional[dict] = None
+    extra_body: Optional[Dict[str, Any]] = None
 
 # ---------- redis connect ----------
 async def redis_connect():
@@ -499,7 +552,8 @@ def start_runtime_container_sync(model_id, extra_args=None):
         "restart_policy": {"Name": "no"},
         "environment": {
             "HF_HUB_DISABLE_PROGRESS_BARS": "1",  # Disable progress bars in non-TTY environment
-            "TQDM_DISABLE": "1"  # Also disable tqdm globally
+            "TQDM_DISABLE": "1",  # Also disable tqdm globally
+            "VLLM_SLEEP_WHEN_IDLE": "1",  # Reduce busy-spin CPU usage when idle
         }
     }
     
@@ -626,7 +680,9 @@ async def wait_for_runtime_ready(timeout=600):
                 container = docker_client.containers.get(CONTAINER_NAME)
                 if container.status == "exited":
                     # Container crashed - check exit code and logs
-                    exit_code = container.attrs.get('State', {}).get('ExitCode', -1)
+                    state_attrs = container.attrs.get('State', {})
+                    exit_code = state_attrs.get('ExitCode', -1)
+                    oom_killed = bool(state_attrs.get('OOMKilled'))
                     model = state.get("loading_model") or state.get("current_model")
                     logs = container.logs(tail=200).decode('utf-8')
                     # Detect vLLM KV cache insufficient error and auto-tune max sequence length once
@@ -662,54 +718,54 @@ async def wait_for_runtime_ready(timeout=600):
                     # Exit code 137 = SIGKILL (often OOM killer)
                     # Exit code 139 = SIGSEGV (segfault)
                     # Exit code 1 = general error
-                    
-                    failure_reason = "runtime_crashed"
 
-                    if exit_code == 137 or "out of memory" in logs.lower() or "oom" in logs.lower() or "CUDA out of memory" in logs:
+                    failure_reason = "runtime_crashed"
+                    logs_snippet = logs[-500:]
+
+                    if _looks_like_runtime_oom(exit_code, logs, oom_killed=oom_killed):
                         failure_reason = "runtime_oom"
-                        log.error("runtime_oom", model=model, exit_code=exit_code, logs=logs[-500:])
+                        log.error("runtime_oom", model=model, exit_code=exit_code, logs=logs_snippet)
                         try:
                             if model:
                                 model_failures.labels(model=model, reason="oom").inc()
                         except Exception:
                             pass
-                        # Mark model as OOM for 24 hours
                         if model:
                             await redis.set(f"model_oom:{model}", str(now()), ex=86400)
                     elif "has no SGlang implementation" in logs or "not compatible with SGLang" in logs:
                         failure_reason = "model_incompatible"
-                        log.error("model_not_supported", model=model, exit_code=exit_code, logs=logs[-500:])
+                        log.error("model_not_supported", model=model, exit_code=exit_code, logs=logs_snippet)
                         try:
                             if model:
                                 model_failures.labels(model=model, reason="incompatible").inc()
                         except Exception:
                             pass
-                        # Mark model as incompatible permanently (30 days)
                         if model:
                             await redis.set(f"model_incompatible:{model}", str(now()), ex=2592000)
                     elif exit_code == 139:
                         failure_reason = "runtime_segfault"
-                        log.error("runtime_segfault", model=model, exit_code=exit_code, logs=logs[-500:])
+                        log.error("runtime_segfault", model=model, exit_code=exit_code, logs=logs_snippet)
                         try:
                             if model:
                                 model_failures.labels(model=model, reason="segfault").inc()
                         except Exception:
                             pass
-                        # Segfault might be model-specific, mark for 6 hours
                         if model:
                             await redis.set(f"model_failure:{model}", str(now()), ex=21600)
                     else:
-                        failure_reason = "runtime_crashed"
-                        log.error("runtime_crashed", model=model, exit_code=exit_code, logs=logs[-500:])
+                        log.error("runtime_crashed", model=model, exit_code=exit_code, logs=logs_snippet)
                         try:
                             if model:
                                 model_failures.labels(model=model, reason="crashed").inc()
                         except Exception:
                             pass
-                        # Mark model as failed for 1 hour (might be transient)
                         if model:
                             await redis.set(f"model_failure:{model}", str(now()), ex=3600)
-                    
+
+                    log_path = persist_runtime_failure_log(model, failure_reason, logs)
+                    if log_path:
+                        log.info("runtime_failure_log_saved", model=model, reason=failure_reason, path=log_path)
+
                     return False, failure_reason
             except docker.errors.NotFound:
                 pass
@@ -767,10 +823,23 @@ async def runtime_proxy(endpoint: str, payload: dict, timeout=120, source: str =
             try:
                 async with httpx.AsyncClient() as client:
                     async with client.stream("POST", url, json=payload, timeout=timeout) as r:
-                        r.raise_for_status()
+                        if r.status_code >= 400:
+                            state["last_runtime_err_ts"] = now()
+                            error_payload: Any
+                            try:
+                                error_payload = await r.aread()
+                                try:
+                                    error_payload = json.loads(error_payload)
+                                except Exception:
+                                    error_payload = error_payload.decode("utf-8", errors="replace")
+                            except Exception:
+                                error_payload = "stream_error"
+                            raise HTTPException(status_code=r.status_code, detail=error_payload)
                         async for chunk in r.aiter_bytes():
                             yield chunk
                 state["last_runtime_ok_ts"] = now()
+            except HTTPException:
+                raise
             except Exception:
                 state["last_runtime_err_ts"] = now()
                 raise
@@ -786,9 +855,18 @@ async def runtime_proxy(endpoint: str, payload: dict, timeout=120, source: str =
         try:
             async with httpx.AsyncClient() as client:
                 r = await client.post(url, json=payload, timeout=timeout)
-                r.raise_for_status()
+                if r.status_code >= 400:
+                    state["last_runtime_err_ts"] = now()
+                    error_detail: Any
+                    try:
+                        error_detail = r.json()
+                    except Exception:
+                        error_detail = r.text
+                    raise HTTPException(status_code=r.status_code, detail=error_detail)
                 state["last_runtime_ok_ts"] = now()
                 return r.json()
+        except HTTPException:
+            raise
         except Exception:
             state["last_runtime_err_ts"] = now()
             raise
@@ -992,8 +1070,31 @@ async def analyze_queue_storage_needs() -> Dict[str, Dict]:
         
         needs[model_id]["job_count"] += 1
         needs[model_id]["total_priority"] += int(h.get("priority", 1))
-    
+
     return needs
+
+async def get_model_block_reason(model_id: str) -> Optional[str]:
+    """Return the active failure flag for a model, if any."""
+    if not redis:
+        return None
+    keys = (
+        f"model_oom:{model_id}",
+        f"model_incompatible:{model_id}",
+        f"model_failure:{model_id}",
+    )
+    try:
+        flags = await redis.mget(*keys)
+    except Exception:
+        return None
+    if not flags:
+        return None
+    if flags[0]:
+        return "model_oom"
+    if len(flags) > 1 and flags[1]:
+        return "model_incompatible"
+    if len(flags) > 2 and flags[2]:
+        return "model_failure"
+    return None
 
 async def proactive_storage_management():
     """Proactively manage storage based on queue analysis"""
@@ -1011,13 +1112,11 @@ async def proactive_storage_management():
     
     # Download missing models in order of importance
     for model_id, info in models_by_importance:
+        block_reason = await get_model_block_reason(model_id)
+        if block_reason:
+            log.debug("storage_skip_flagged_model", model_id=model_id, reason=block_reason)
+            continue
         if not info["on_disk"] and not info["is_current"]:
-            # Skip models with recent definitive failures
-            try:
-                if await redis.get(f"model_failure:{model_id}"):
-                    continue
-            except Exception:
-                pass
             # Check disk space before downloading
             if await ensure_disk_space(100):  # Assume 100GB needed
                 log.info("proactive_download_starting", model_id=model_id, job_count=info["job_count"])
@@ -1026,6 +1125,10 @@ async def proactive_storage_management():
     
     # Prefetch high-priority models that might be used soon
     for model_id, info in models_by_importance[:2]:  # Top 2 models
+        block_reason = await get_model_block_reason(model_id)
+        if block_reason:
+            log.debug("prefetch_skip_flagged_model", model_id=model_id, reason=block_reason)
+            continue
         if info["on_disk"] and not info["is_current"] and not info["in_page_cache"]:
             log.debug("proactive_prefetch", model_id=model_id)  # Changed to debug level
             asyncio.create_task(prefetch_pagecache_async(model_id))
@@ -1663,7 +1766,8 @@ async def completions(req: CompletionRequest, response: Response, auth: bool = D
     # Check if realtime model is hot
     if state.get("current_model") == REALTIME_MODEL and is_runtime_ready():
         try:
-            payload = req.dict()
+            payload = req.dict(exclude_none=True)
+            extra_body = payload.pop("extra_body", None)
             # Adjust logprobs semantics for completions: vLLM expects integer top-K
             lp = payload.get("logprobs")
             tlp = payload.get("top_logprobs")
@@ -1678,6 +1782,11 @@ async def completions(req: CompletionRequest, response: Response, auth: bool = D
             # Remove top_logprobs for completions
             if "top_logprobs" in payload:
                 payload.pop("top_logprobs", None)
+            if extra_body:
+                if isinstance(extra_body, dict):
+                    payload.update(extra_body)
+                else:
+                    log.warning("extra_body_update_failed", error="non-mapping extra_body ignored")
             return await runtime_proxy("/v1/completions", payload, source="realtime")
         except httpx.ConnectError as e:
             # Runtime is actually down
@@ -1733,7 +1842,14 @@ async def chat_completions(req: ChatCompletionRequest, response: Response, auth:
     # Check if realtime model is hot
     if state.get("current_model") == REALTIME_MODEL and is_runtime_ready():
         try:
-            return await runtime_proxy("/v1/chat/completions", req.dict(), source="realtime")
+            payload = req.dict(exclude_none=True)
+            extra_body = payload.pop("extra_body", None)
+            if extra_body:
+                if isinstance(extra_body, dict):
+                    payload.update(extra_body)
+                else:
+                    log.warning("extra_body_update_failed", error="non-mapping extra_body ignored")
+            return await runtime_proxy("/v1/chat/completions", payload, source="realtime")
         except httpx.ConnectError as e:
             # Runtime is actually down
             log.error("chat_completions_proxy_connect_error", error=str(e))
@@ -1786,6 +1902,10 @@ async def batch_completions(req: BatchCompletionRequest, response: Response, aut
         "top_p": str(req.top_p),
         "n": str(req.n),
         "stop": json.dumps(req.stop) if req.stop else "null",
+        "logprobs": json.dumps(req.logprobs) if req.logprobs is not None else "null",
+        "top_logprobs": json.dumps(req.top_logprobs) if req.top_logprobs is not None else "null",
+        "response_format": json.dumps(req.response_format) if req.response_format else "null",
+        "extra_body": json.dumps(req.extra_body) if req.extra_body else "null",
         "priority": str(req.priority),
         "status": "queued",
         "submit_ts": str(submit_ts),
@@ -1864,6 +1984,10 @@ async def batch_chat_completions(req: BatchChatCompletionRequest, response: Resp
         "top_p": str(req.top_p),
         "n": str(req.n),
         "stop": json.dumps(req.stop) if req.stop else "null",
+        "logprobs": json.dumps(req.logprobs) if req.logprobs is not None else "null",
+        "top_logprobs": json.dumps(req.top_logprobs) if req.top_logprobs is not None else "null",
+        "response_format": json.dumps(req.response_format) if req.response_format else "null",
+        "extra_body": json.dumps(req.extra_body) if req.extra_body else "null",
         "priority": str(req.priority),
         "status": "queued",
         "submit_ts": str(submit_ts),
@@ -2031,9 +2155,10 @@ async def batch_planner_loop():
                 oom_key = f"model_oom:{mid}"
                 incompatible_key = f"model_incompatible:{mid}"
 
-                failure = await redis.get(failure_key)
-                oom = await redis.get(oom_key)
-                incompatible = await redis.get(incompatible_key)
+                try:
+                    failure, oom, incompatible = await redis.mget(failure_key, oom_key, incompatible_key)
+                except Exception:
+                    failure = oom = incompatible = None
 
                 # If prior failure was a download/availability issue but the model is now on disk,
                 # clear the transient failure flag so the scheduler can proceed.
@@ -2045,6 +2170,12 @@ async def batch_planner_loop():
                         pass
 
                 if failure or oom or incompatible:
+                    block_reason = "model_failure"
+                    if oom:
+                        block_reason = "model_oom"
+                    elif incompatible:
+                        block_reason = "model_incompatible"
+
                     log.debug(
                         "skipping_failed_model",
                         model=mid,
@@ -2052,6 +2183,12 @@ async def batch_planner_loop():
                         oom=bool(oom),
                         incompatible=bool(incompatible),
                     )
+
+                    if items:
+                        try:
+                            await drop_queued_jobs_for_model(mid, reason=block_reason)
+                        except Exception as drop_err:
+                            log.warning("drop_jobs_for_flagged_model_failed", model=mid, error=str(drop_err))
                     continue
                     
                 job_count = len(items)
@@ -2296,8 +2433,12 @@ async def batch_planner_loop():
                         next_model = mid
                         break
                 if next_model and check_model_on_disk(next_model):
-                    log.info("prefetching_next_model_pagecache", current=best_model, next=next_model)
-                    asyncio.create_task(prefetch_pagecache_async(next_model))
+                    block_reason = await get_model_block_reason(next_model)
+                    if block_reason:
+                        log.debug("skip_prefetch_flagged_model", current=best_model, next=next_model, reason=block_reason)
+                    else:
+                        log.info("prefetching_next_model_pagecache", current=best_model, next=next_model)
+                        asyncio.create_task(prefetch_pagecache_async(next_model))
 
             # Process jobs with a bounded number of inflight requests; keep pipeline full
             completed_count = 0
@@ -2321,9 +2462,33 @@ async def batch_planner_loop():
                 jobh = await redis.hgetall(JOB_HASH_PREFIX + jid)
                 if not jobh:
                     return None
-                
+
                 job_type = jobh.get("type", "completion")
                 eval_name_local = jobh.get("eval_name") or None
+
+                def _decode_json_field(val: Optional[str]):
+                    if val is None or val == "" or val == "null":
+                        return None
+                    try:
+                        return json.loads(val)
+                    except Exception:
+                        return val
+
+                def _coerce_positive_int(val: Any) -> Optional[int]:
+                    try:
+                        if isinstance(val, bool) or val is None:
+                            return None
+                        if isinstance(val, (int, float)):
+                            iv = int(val)
+                        elif isinstance(val, str):
+                            if not val.strip():
+                                return None
+                            iv = int(float(val)) if ("." in val and val.replace('.', '', 1).isdigit()) else int(val)
+                        else:
+                            return None
+                        return iv if iv > 0 else None
+                    except Exception:
+                        return None
 
                 async def _call_with_retries(endpoint: str, request_data: dict):
                     """Call runtime with retries for eval jobs only; returns (result, error_info)."""
@@ -2404,21 +2569,25 @@ async def batch_planner_loop():
                             except Exception:
                                 pass
                         # Optional: logprobs/top_logprobs (vLLM completions expects integer logprobs)
-                        lp = jobh.get("logprobs")
-                        tlp = jobh.get("top_logprobs")
+                        lp = _decode_json_field(jobh.get("logprobs"))
+                        tlp = _decode_json_field(jobh.get("top_logprobs"))
                         # Determine top-k from either integer or boolean+top_logprobs
                         topk = None
-                        try:
-                            if lp and lp not in ("0", "false", "False"):
-                                # If lp is numeric string, use it; if boolean true, fallback to tlp or default 8
-                                if lp.isdigit():
-                                    topk = int(lp)
-                                else:
-                                    topk = int(tlp) if (tlp and tlp.isdigit()) else 8
-                        except Exception:
-                            topk = None
+                        if isinstance(lp, bool):
+                            if lp:
+                                topk = _coerce_positive_int(tlp) or 8
+                        elif lp is not None:
+                            topk = _coerce_positive_int(lp)
                         if topk is not None:
                             request_data["logprobs"] = topk
+                        # Structured outputs / extras
+                        # Structured outputs / extras
+                        response_format = _decode_json_field(jobh.get("response_format"))
+                        if isinstance(response_format, dict):
+                            request_data["response_format"] = response_format
+                        extra_body = _decode_json_field(jobh.get("extra_body"))
+                        if isinstance(extra_body, dict):
+                            request_data.update(extra_body)
                         res, err = await _call_with_retries("/v1/completions", request_data)
                         if err is not None:
                             await redis.hset(JOB_HASH_PREFIX + jid, mapping={
@@ -2451,15 +2620,24 @@ async def batch_planner_loop():
                         except Exception:
                             pass
                         # Optional: logprobs/top_logprobs (chat expects bool + int)
-                        lp = jobh.get("logprobs")
-                        if lp is not None and lp != "":
-                            request_data["logprobs"] = True if lp in ("1", "true", "True") else False
-                        tlp = jobh.get("top_logprobs")
-                        if tlp is not None and tlp != "":
-                            try:
-                                request_data["top_logprobs"] = int(tlp)
-                            except Exception:
-                                pass
+                        lp = _decode_json_field(jobh.get("logprobs"))
+                        if isinstance(lp, bool):
+                            request_data["logprobs"] = lp
+                        elif isinstance(lp, (int, float)):
+                            request_data["logprobs"] = bool(lp)
+                        elif isinstance(lp, str) and lp:
+                            request_data["logprobs"] = lp.lower() in ("1", "true", "yes")
+                        tlp = _decode_json_field(jobh.get("top_logprobs"))
+                        topk = _coerce_positive_int(tlp)
+                        if topk is not None:
+                            request_data["top_logprobs"] = topk
+                        # Structured outputs / extras
+                        response_format = _decode_json_field(jobh.get("response_format"))
+                        if isinstance(response_format, dict):
+                            request_data["response_format"] = response_format
+                        extra_body = _decode_json_field(jobh.get("extra_body"))
+                        if isinstance(extra_body, dict):
+                            request_data.update(extra_body)
                         res, err = await _call_with_retries("/v1/chat/completions", request_data)
                         if err is not None:
                             await redis.hset(JOB_HASH_PREFIX + jid, mapping={
