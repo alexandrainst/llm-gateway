@@ -1,76 +1,79 @@
 # LLM Gateway Orchestrator (realtime + batch)
 
-## Run locally
-1. git clone this repo (put files as above)
-2. Copy env example and adjust if needed: `cp .env.vllm.example .env`
-3. Copy auth keys example and adjust tokens/scopes: `cp config/example.keys.json config/auth.keys.json`
-4. docker-compose up --build
+Single-node FastAPI service that keeps a realtime model hot while scheduling batch jobs to a GPU runtime container via Docker and Redis.
 
-Services:
-- Orchestrator API/UI: http://localhost:8000
-- Redis: localhost:6379
+## Requirements
+- Docker + Docker Compose with NVIDIA Container Toolkit
+- Host Hugging Face cache directory exported via `HOST_HF_CACHE=/path/to/cache` (Compose binds it into containers at `/host_hf_cache`)
+- `.env` based on `.env.vllm.example`
+- Scoped auth keys file at `config/auth.keys.json` (copy `config/example.keys.json`)
 
-## Realtime demo (requires auth)
-Token must have `realtime` scope:
+## Quickstart
+1. `cp .env.vllm.example .env`
+2. `cp config/example.keys.json config/auth.keys.json`
+3. `docker compose up --build`
 
+Services (listening on `0.0.0.0`): API `http://<host>:8000`, UI `http://<host>:8000/dashboard`, metrics `http://<host>:8000/metrics` (requires `monitor` scope), Redis `redis://<host>:6379`.
+
+## Configuration
+| Variable | Purpose |
+| --- | --- |
+| `RUNTIME_TYPE` | `vllm` (default) or `sglang`; controls runtime image/args |
+| `RUNTIME_IMAGE`, `RUNTIME_ARGS` | Docker image and CLI args passed to `llm_runtime` |
+| `REALTIME_MODEL` | Model to keep hot for `/v1/completions` & `/v1/chat/completions` |
+| `MAX_CONCURRENT_BATCH` | Upper bound on simultaneous batch requests |
+| `AUTH_KEYS_FILE` | Container path to scoped key JSON (mounted via Compose) |
+| `EUROEVAL_DEBUG_LOG` | Optional path for EuroEval adapter debug output |
+
+Update `.env` and restart the orchestrator container to apply changes.
+
+## Auth Scopes
+| Scope | Grants |
+| --- | --- |
+| `realtime` | `/v1/completions`, `/v1/chat/completions`, `/v1/models` |
+| `batch` | `/v1/batch/*`, `/v1/jobs/*` |
+| `eval` | `/eval/*` endpoints from `eval_manager` |
+| `upload` | `/v1/upload/*` TUS endpoints |
+| `monitor` | `/dashboard`, `/metrics`, queue/eval UI JSON |
+
+Scopes load once at startup; restart the container after editing `config/auth.keys.json`.
+
+## API Usage
+Realtime:
 ```
-curl -X POST \
-  -H "Authorization: Bearer example-realtime-token" \
+curl -sS -X POST \
+  -H "Authorization: Bearer $REALTIME_TOKEN" \
   -H "Content-Type: application/json" \
-  "http://localhost:8000/v1/completions" \
+  http://localhost:8000/v1/completions \
   -d '{"model":"synquid/gemma-3-27b-it-FP8","prompt":"hello","max_tokens":16}'
 ```
 
-Cold start may return 503 with Retry-After; retry after the delay.
-
-## Batch demo (requires auth)
-Token must have `batch` scope:
-
+Batch:
 ```
-curl -X POST \
-  -H "Authorization: Bearer example-batch-token" \
+curl -sS -X POST \
+  -H "Authorization: Bearer $BATCH_TOKEN" \
   -H "Content-Type: application/json" \
-  "http://localhost:8000/v1/batch/completions" \
-  -d '{"model":"mistralai/Mistral-7B-Instruct-v0.1","prompt":"Write a haiku about snow.","max_tokens":32,"priority":1}'
+  http://localhost:8000/v1/batch/completions \
+  -d '{"model":"mistralai/Mistral-7B-Instruct-v0.1","prompt":"Write a haiku","max_tokens":32,"priority":1}'
 ```
+Poll the `status_url` from the 202 response until `status` becomes `completed`.
 
-Use the `status_url` returned to check progress:
+## Runtime & Logs
+- Orchestrator starts/stops the `llm_runtime` container as needed; use `docker logs orchestrator` and `docker logs llm_runtime` for diagnostics.
+- Runtime crashes persist short logs under `/host_hf_cache/runtime_failures`.
+- EuroEval adapter writes to `$EUROEVAL_DEBUG_LOG` (defaults to `./euroeval_debug.log`).
+- Build custom runtime images with `runtime/Dockerfile` (e.g., patched NCCL) and point `RUNTIME_IMAGE` to the new tag.
 
-```
-curl -H "Authorization: Bearer example-batch-token" \
-  "http://localhost:8000/v1/batch/completions/<id>"
-```
+## Evaluations
+`eval-repo/run_eval.py` implements the evaluation protocol:
+- `python eval-repo/run_eval.py list [--base-model]`
+- `python eval-repo/run_eval.py prepare <eval_name> <model> [options]`
+- `python eval-repo/run_eval.py score <eval_name>` (stdin JSON)
 
-## Notes
-- Orchestrator dynamically starts/stops the runtime container (vLLM or SGLang) based on demand.
-- `download_model_async` and storage helpers expect models in the shared HF cache; large models benefit from page‑cache priming.
-- UI: visit `/dashboard` and supply a token with the `monitor` scope.
+See `eval-repo/PROTOCOL.md` for request/response schema details.
 
-## Authentication (scoped)
-
-- Keys load from a static JSON at startup; see `config/example.keys.json`.
-- `AUTH_KEYS_FILE` must point to a container path (Compose mounts `./config/auth.keys.json` to `/app-config/auth.keys.json`).
-- Scopes: `realtime`, `batch`, `upload`, `eval`, `monitor`.
-- UI: `/dashboard` is public; UI data endpoints require a token with `monitor`. Use `?key=YOUR_TOKEN`.
-- Reload keys: edit the JSON file and restart the orchestrator container.
-
-## Use a Patched vLLM Runtime Image (optional)
-
-If the published `vllm/vllm-openai:latest` has a Python dependency issue (e.g., NCCL), use the simple Dockerfile to rebuild on top of it and update only NCCL:
-
-1) Build a minimal patched image (updates `nvidia-nccl-cu12`):
-
-```
-docker build -f runtime/Dockerfile \
-  --build-arg NCCL_VERSION=2.21.5 \
-  -t vllm-openai:nccl-patched .
-```
-
-2) Point the orchestrator to your patched image (set in `.env`):
-
-```
-RUNTIME_TYPE=vllm
-RUNTIME_IMAGE=vllm-openai:nccl-patched
-```
-
-This avoids rebuilding the heavy vLLM image from source and only updates the NCCL wheel in the Python environment used by the server.
+## Troubleshooting
+- 503 with `Retry-After`: runtime is cold-starting; wait and retry.
+- 401: token missing required scope (see table above).
+- Batch job stuck: check Redis (`job:<id>` hash) and orchestrator logs for failure flags.
+- No eval output: inspect `$EUROEVAL_DEBUG_LOG` and EuroEval stdout for tracebacks.
