@@ -238,8 +238,10 @@ class CompletionRequest(BaseModel):
     logprobs: Optional[Union[int, bool]] = None
     top_logprobs: Optional[int] = None
     response_format: Optional[dict] = None
-    # vLLM passthrough for additional sampling params (e.g., guided_* for structured outputs)
-    extra_body: Optional[Dict[str, Any]] = None
+    guided_json: Optional[Any] = None
+    guided_regex: Optional[str] = None
+    guided_choice: Optional[Any] = None
+    guided_grammar: Optional[Any] = None
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -255,8 +257,10 @@ class ChatCompletionRequest(BaseModel):
     logprobs: Optional[bool] = None
     top_logprobs: Optional[int] = None
     response_format: Optional[dict] = None
-    # vLLM passthrough for additional sampling params (e.g., guided_* for structured outputs)
-    extra_body: Optional[Dict[str, Any]] = None
+    guided_json: Optional[Any] = None
+    guided_regex: Optional[str] = None
+    guided_choice: Optional[Any] = None
+    guided_grammar: Optional[Any] = None
 
 class JobSubmit(BaseModel):
     model: str  # Changed from model_id for consistency
@@ -278,7 +282,10 @@ class BatchCompletionRequest(BaseModel):
     logprobs: Optional[Union[int, bool]] = None
     top_logprobs: Optional[int] = None
     response_format: Optional[dict] = None
-    extra_body: Optional[Dict[str, Any]] = None
+    guided_json: Optional[Any] = None
+    guided_regex: Optional[str] = None
+    guided_choice: Optional[Any] = None
+    guided_grammar: Optional[Any] = None
 
 class BatchChatCompletionRequest(BaseModel):
     model: str
@@ -294,7 +301,10 @@ class BatchChatCompletionRequest(BaseModel):
     logprobs: Optional[bool] = None
     top_logprobs: Optional[int] = None
     response_format: Optional[dict] = None
-    extra_body: Optional[Dict[str, Any]] = None
+    guided_json: Optional[Any] = None
+    guided_regex: Optional[str] = None
+    guided_choice: Optional[Any] = None
+    guided_grammar: Optional[Any] = None
 
 # ---------- redis connect ----------
 async def redis_connect():
@@ -1767,7 +1777,6 @@ async def completions(req: CompletionRequest, response: Response, auth: bool = D
     if state.get("current_model") == REALTIME_MODEL and is_runtime_ready():
         try:
             payload = req.dict(exclude_none=True)
-            extra_body = payload.pop("extra_body", None)
             # Adjust logprobs semantics for completions: vLLM expects integer top-K
             lp = payload.get("logprobs")
             tlp = payload.get("top_logprobs")
@@ -1782,11 +1791,6 @@ async def completions(req: CompletionRequest, response: Response, auth: bool = D
             # Remove top_logprobs for completions
             if "top_logprobs" in payload:
                 payload.pop("top_logprobs", None)
-            if extra_body:
-                if isinstance(extra_body, dict):
-                    payload.update(extra_body)
-                else:
-                    log.warning("extra_body_update_failed", error="non-mapping extra_body ignored")
             return await runtime_proxy("/v1/completions", payload, source="realtime")
         except httpx.ConnectError as e:
             # Runtime is actually down
@@ -1843,12 +1847,6 @@ async def chat_completions(req: ChatCompletionRequest, response: Response, auth:
     if state.get("current_model") == REALTIME_MODEL and is_runtime_ready():
         try:
             payload = req.dict(exclude_none=True)
-            extra_body = payload.pop("extra_body", None)
-            if extra_body:
-                if isinstance(extra_body, dict):
-                    payload.update(extra_body)
-                else:
-                    log.warning("extra_body_update_failed", error="non-mapping extra_body ignored")
             return await runtime_proxy("/v1/chat/completions", payload, source="realtime")
         except httpx.ConnectError as e:
             # Runtime is actually down
@@ -1905,7 +1903,10 @@ async def batch_completions(req: BatchCompletionRequest, response: Response, aut
         "logprobs": json.dumps(req.logprobs) if req.logprobs is not None else "null",
         "top_logprobs": json.dumps(req.top_logprobs) if req.top_logprobs is not None else "null",
         "response_format": json.dumps(req.response_format) if req.response_format else "null",
-        "extra_body": json.dumps(req.extra_body) if req.extra_body else "null",
+        "guided_json": json.dumps(req.guided_json) if req.guided_json is not None else "null",
+        "guided_regex": json.dumps(req.guided_regex) if req.guided_regex is not None else "null",
+        "guided_choice": json.dumps(req.guided_choice) if req.guided_choice is not None else "null",
+        "guided_grammar": json.dumps(req.guided_grammar) if req.guided_grammar is not None else "null",
         "priority": str(req.priority),
         "status": "queued",
         "submit_ts": str(submit_ts),
@@ -1987,7 +1988,10 @@ async def batch_chat_completions(req: BatchChatCompletionRequest, response: Resp
         "logprobs": json.dumps(req.logprobs) if req.logprobs is not None else "null",
         "top_logprobs": json.dumps(req.top_logprobs) if req.top_logprobs is not None else "null",
         "response_format": json.dumps(req.response_format) if req.response_format else "null",
-        "extra_body": json.dumps(req.extra_body) if req.extra_body else "null",
+        "guided_json": json.dumps(req.guided_json) if req.guided_json is not None else "null",
+        "guided_regex": json.dumps(req.guided_regex) if req.guided_regex is not None else "null",
+        "guided_choice": json.dumps(req.guided_choice) if req.guided_choice is not None else "null",
+        "guided_grammar": json.dumps(req.guided_grammar) if req.guided_grammar is not None else "null",
         "priority": str(req.priority),
         "status": "queued",
         "submit_ts": str(submit_ts),
@@ -2580,14 +2584,14 @@ async def batch_planner_loop():
                             topk = _coerce_positive_int(lp)
                         if topk is not None:
                             request_data["logprobs"] = topk
-                        # Structured outputs / extras
-                        # Structured outputs / extras
+                        # Structured outputs
                         response_format = _decode_json_field(jobh.get("response_format"))
                         if isinstance(response_format, dict):
                             request_data["response_format"] = response_format
-                        extra_body = _decode_json_field(jobh.get("extra_body"))
-                        if isinstance(extra_body, dict):
-                            request_data.update(extra_body)
+                        for guided_key in ("guided_json", "guided_regex", "guided_choice", "guided_grammar"):
+                            guided_val = _decode_json_field(jobh.get(guided_key))
+                            if guided_val is not None and guided_val != "":
+                                request_data[guided_key] = guided_val
                         res, err = await _call_with_retries("/v1/completions", request_data)
                         if err is not None:
                             await redis.hset(JOB_HASH_PREFIX + jid, mapping={
@@ -2631,13 +2635,14 @@ async def batch_planner_loop():
                         topk = _coerce_positive_int(tlp)
                         if topk is not None:
                             request_data["top_logprobs"] = topk
-                        # Structured outputs / extras
+                        # Structured outputs
                         response_format = _decode_json_field(jobh.get("response_format"))
                         if isinstance(response_format, dict):
                             request_data["response_format"] = response_format
-                        extra_body = _decode_json_field(jobh.get("extra_body"))
-                        if isinstance(extra_body, dict):
-                            request_data.update(extra_body)
+                        for guided_key in ("guided_json", "guided_regex", "guided_choice", "guided_grammar"):
+                            guided_val = _decode_json_field(jobh.get(guided_key))
+                            if guided_val is not None and guided_val != "":
+                                request_data[guided_key] = guided_val
                         res, err = await _call_with_retries("/v1/chat/completions", request_data)
                         if err is not None:
                             await redis.hset(JOB_HASH_PREFIX + jid, mapping={
