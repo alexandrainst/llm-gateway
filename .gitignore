@@ -12,3 +12,7 @@ wheels/
 .env
 
 data/
+
+# Allow vendored RULER synthetic scripts/data to be tracked
+!eval-repo/evals/RULER-da/scripts/data/
+!eval-repo/evals/RULER-da/scripts/data/**
