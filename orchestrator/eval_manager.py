@@ -782,6 +782,13 @@ class EvalManager:
                 "responses": responses,
                 "metadata": metadata
             }
+
+            logger.info(
+                "score_input_metadata",
+                eval_name=eval_name,
+                has_dataset_metadata=bool(metadata.get("dataset_metadata")) if isinstance(metadata, dict) else False,
+                metadata_keys=list(metadata.keys()) if isinstance(metadata, dict) else None,
+            )
             
             # Debug: Log sample of what we're sending to scoring
             with open("/tmp/eval_debug.log", "a") as f:
@@ -828,9 +835,19 @@ class EvalManager:
             logger.error(f"Error scoring results for {eval_name}: {e}")
             return None
     
-    async def _save_eval_interactions(self, job_id: str, eval_name: str, 
-                                     requests: List[Dict], responses: List[Dict], metadata: Dict):
-        """Save requests and responses for debugging and analysis."""
+    async def _save_eval_interactions(self, job_id: str, eval_name: str,
+                                     requests: List[Dict], responses: List[Dict], metadata: Dict,
+                                     annotations: Optional[List[Optional[Dict[str, Any]]]] = None):
+        """Save requests and responses for debugging and analysis.
+
+        Args:
+            job_id: Eval job identifier.
+            eval_name: Name of the evaluation.
+            requests: List of request payloads.
+            responses: List of response payloads.
+            metadata: Metadata captured during request preparation.
+            annotations: Optional per-example judgement metadata (aligned with requests).
+        """
         try:
             job_data = await self.get_eval_status(job_id)
             if not job_data:
@@ -846,6 +863,24 @@ class EvalManager:
             eval_job_dir = self.data_dir / safe_model / job_timestamp
             eval_job_dir.mkdir(parents=True, exist_ok=True)
             
+            analysis_rows: Optional[List[Dict[str, Any]]] = [] if annotations is not None else None
+
+            def _json_safe(value: Any) -> Any:
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    return value
+                if hasattr(value, "item") and callable(getattr(value, "item")):
+                    try:
+                        return value.item()  # type: ignore[no-any-return]
+                    except Exception:
+                        pass
+                if isinstance(value, list):
+                    return [_json_safe(v) for v in value]
+                if isinstance(value, tuple):
+                    return [_json_safe(v) for v in value]
+                if isinstance(value, dict):
+                    return {str(k): _json_safe(v) for k, v in value.items()}
+                return str(value)
+
             # Save human-readable interactions file
             interactions_file = eval_job_dir / f"{eval_name}_interactions.txt"
             with open(interactions_file, "w", encoding="utf-8") as f:
@@ -873,6 +908,7 @@ class EvalManager:
                     
                     for idx, req, resp in examples:
                         f.write(f"--- Example {idx + 1} ---\n")
+                        annotation = annotations[idx] if annotations and idx < len(annotations) else None
                         
                         # Write prompt/messages
                         if "messages" in req:
@@ -885,6 +921,8 @@ class EvalManager:
                         
                         # Write response
                         f.write(f"[RESPONSE]:\n")
+                        response_text = ""
+                        finish_reason = "unknown"
                         if isinstance(resp, dict):
                             if "choices" in resp and len(resp["choices"]) > 0:
                                 choice = resp["choices"][0]
@@ -924,18 +962,60 @@ class EvalManager:
                                     content = ""
                                 
                                 finish_reason = choice.get("finish_reason", "unknown")
-                                f.write(f"{content}\n")
+                                response_text = content or ""
+                                f.write(f"{response_text}\n")
                                 f.write(f"(finish_reason: {finish_reason})\n")
                             elif "text" in resp:
-                                f.write(f"{resp['text']}\n")
+                                response_text = resp["text"]
+                                f.write(f"{response_text}\n")
                             elif "error" in resp:
-                                f.write(f"ERROR: {resp['error']}\n")
+                                response_text = f"ERROR: {resp['error']}"
+                                f.write(f"{response_text}\n")
                             else:
-                                f.write(f"{resp}\n")
+                                response_text = str(resp)
+                                f.write(f"{response_text}\n")
                         else:
-                            f.write(f"{resp}\n")
+                            response_text = str(resp)
+                            f.write(f"{response_text}\n")
+
+                        if annotation:
+                            status = annotation.get("is_correct")
+                            if status is True:
+                                status_text = "CORRECT"
+                            elif status is False:
+                                status_text = "INCORRECT"
+                            else:
+                                status_text = "UNKNOWN"
+                            f.write(f"\n[RESULT]:\n")
+                            f.write(f"Status: {status_text}\n")
+                            if "reference" in annotation and annotation["reference"] is not None:
+                                f.write(f"Expected: {annotation['reference']}\n")
+                            if "prediction" in annotation and annotation["prediction"] is not None:
+                                f.write(f"Prediction: {annotation['prediction']}\n")
+                        
+                        if analysis_rows is not None:
+                            analysis_rows.append(
+                                {
+                                    "index": idx,
+                                    "dataset": annotation.get("dataset") if annotation else subdataset,
+                                    "request": _json_safe(req),
+                                    "response": _json_safe(resp),
+                                    "response_text": response_text,
+                                    "finish_reason": finish_reason,
+                                    "prediction": annotation.get("prediction") if annotation else None,
+                                    "reference": annotation.get("reference") if annotation else None,
+                                    "is_correct": annotation.get("is_correct") if annotation else None,
+                                }
+                            )
                         
                         f.write(f"\n{'-'*60}\n\n")
+
+            if analysis_rows is not None:
+                analysis_file = eval_job_dir / f"{eval_name}_analysis.jsonl"
+                with open(analysis_file, "w", encoding="utf-8") as analysis_f:
+                    for row in analysis_rows:
+                        analysis_f.write(json.dumps(row) + "\n")
+                logger.info(f"Saved structured analysis to {analysis_file}")
             
             logger.info(f"Saved {len(requests)} interactions to {interactions_file}")
             
@@ -1011,6 +1091,72 @@ class EvalManager:
             logger.info(f"Saved debug responses to {debug_file}")
         
         logger.info(f"Saved eval result for {model}/{eval_name} to {results_file}")
+
+        # Update interactions file with correctness annotations and structured analysis
+        requests_for_output = result.get("requests", [])
+        responses_for_output = result.get("responses", [])
+        metadata_for_output = result.get("metadata", {})
+        if not isinstance(metadata_for_output, dict):
+            metadata_for_output = {}
+        annotations: Optional[List[Optional[Dict[str, Any]]]] = None
+
+        if requests_for_output and responses_for_output:
+            total_examples = len(requests_for_output)
+            per_dataset_details = result.get("details", {})
+            dataset_metadata = metadata_for_output.get("dataset_metadata", {}) if isinstance(metadata_for_output, dict) else {}
+            logger.info(
+                "interaction_annotation_inputs",
+                eval_name=eval_name,
+                total_examples=total_examples,
+                has_dataset_metadata=bool(dataset_metadata),
+                metadata_keys=list(metadata_for_output.keys()) if isinstance(metadata_for_output, dict) else None,
+                details_datasets=list(per_dataset_details.keys()) if isinstance(per_dataset_details, dict) else None,
+            )
+
+            if dataset_metadata and isinstance(per_dataset_details, dict):
+                annotations = [None] * total_examples
+                logger.info(
+                    "initialised_annotations",
+                    eval_name=eval_name,
+                    total_examples=total_examples,
+                )
+                for dataset_name, dataset_info in dataset_metadata.items():
+                    per_dataset = per_dataset_details.get(dataset_name, {})
+                    per_example = per_dataset.get("per_example") if isinstance(per_dataset, dict) else None
+                    if not per_example:
+                        logger.info(
+                            "missing_per_example_records",
+                            eval_name=eval_name,
+                            dataset=dataset_name,
+                            available_keys=list(per_dataset.keys()) if isinstance(per_dataset, dict) else None,
+                        )
+                        continue
+                    start_index = dataset_info.get("start_index", 0)
+                    for offset, record in enumerate(per_example):
+                        idx = start_index + offset
+                        if idx >= total_examples:
+                            continue
+                        logger.info(
+                            "annotation_entry",
+                            eval_name=eval_name,
+                            dataset=dataset_name,
+                            idx=idx,
+                        )
+                        annotations[idx] = {
+                            "dataset": dataset_name,
+                            "prediction": record.get("prediction"),
+                            "reference": record.get("reference"),
+                            "is_correct": record.get("is_correct"),
+                        }
+
+        await self._save_eval_interactions(
+            job_id,
+            eval_name,
+            requests_for_output,
+            responses_for_output,
+            metadata_for_output,
+            annotations=annotations,
+        )
     
     async def _update_job_status(self, job_id: str, status: EvalStatus, **kwargs):
         """Update the overall job status."""
