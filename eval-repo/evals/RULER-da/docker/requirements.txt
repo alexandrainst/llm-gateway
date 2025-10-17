@@ -11,6 +11,6 @@ tiktoken
 tenacity
 accelerate
 huggingface_hub==0.23.4
-transformers==4.44.2
+transformers==4.53.0
 vllm==0.5.4
 sentencepiece
