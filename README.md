@@ -38,6 +38,13 @@ Update `.env` and restart the orchestrator container to apply changes.
 
 Scopes load once at startup; restart the container after editing `config/auth.keys.json`.
 
+## Usage Tracking
+- Every authenticated realtime or batch inference call updates per-key counters (requests, successes/errors, prompt/completion tokens) stored in Redis hashes under `key_usage:<key_id>`.
+- Internal eval submissions that originate without a user key log against `INTERNAL_EVAL_KEY_ID` (default `__internal_eval__`) so ops traffic appears in the same usage dashboards.
+- Daily buckets `key_usage:<key_id>::YYYYMMDD` retain roughly 90 days of history for simple day-over-day/month-over-month reporting.
+- Streaming responses automatically request `stream_options.include_usage` so vLLM/SGLang emit usage blocks; ensure the runtime images you deploy support this flag.
+- Operators with a `monitor` token can hit `GET /monitor/key_usage?limit=50&bucket=YYYYMMDD` to fetch the same data via the API, or inspect Redis directly (`redis-cli --scan --pattern 'key_usage:*'` and `HGETALL key_usage:<key_id>` for raw hashes).
+
 ## API Usage
 Realtime:
 ```

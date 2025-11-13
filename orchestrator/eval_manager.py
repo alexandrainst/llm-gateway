@@ -20,6 +20,8 @@ import math
 
 logger = structlog.get_logger()
 
+INTERNAL_EVAL_KEY_ID = os.getenv("INTERNAL_EVAL_KEY_ID", "__internal_eval__")
+
 
 async def run_eval_command(eval_name: str, eval_repo_path: Path, cmd_args: List[str], 
                           stdin_data: Optional[str] = None) -> tuple[int, bytes, bytes]:
@@ -348,7 +350,13 @@ class EvalManager:
         # Track active evaluations
         self.active_evals: Dict[str, asyncio.Task] = {}
     
-    async def submit_eval(self, model: str, evals: List[str] | None = None, prepare_args: Dict | None = None) -> str:
+    async def submit_eval(
+        self,
+        model: str,
+        evals: List[str] | None = None,
+        prepare_args: Dict | None = None,
+        key_id: Optional[str] = None,
+    ) -> str:
         """
         Submit a model for evaluation.
         
@@ -359,6 +367,7 @@ class EvalManager:
             job_id for tracking the evaluation
         """
         job_id = f"eval_{uuid.uuid4().hex[:12]}"
+        effective_key_id = key_id or INTERNAL_EVAL_KEY_ID
         
         # Create initial job state
         job_data = {
@@ -372,6 +381,7 @@ class EvalManager:
             # Optional overrides
             "requested_evals": evals or [],
             "prepare_args": prepare_args or {},
+            "key_id": effective_key_id,
         }
         
         # Store in Redis with 30 day TTL
@@ -455,14 +465,16 @@ class EvalManager:
         Returns dict with completion_ids, eval_groups, and metadata.
         """
         # Load overrides from job record if present
+        job_cfg: Dict[str, Any] = {}
         try:
             job_raw = await self.redis.get(f"eval_job:{job_id}")
             job_cfg = json.loads(job_raw) if job_raw else {}
-            requested_evals = job_cfg.get("requested_evals") or []
-            prepare_args = job_cfg.get("prepare_args") or {}
         except Exception:
-            requested_evals = []
-            prepare_args = {}
+            job_cfg = {}
+
+        requested_evals = job_cfg.get("requested_evals") or []
+        prepare_args = job_cfg.get("prepare_args") or {}
+        key_id = job_cfg.get("key_id") or INTERNAL_EVAL_KEY_ID
         # Check if model is a base model
         is_base_model = await self._check_is_base_model(model)
         
@@ -573,6 +585,8 @@ class EvalManager:
                             "eval_name": eval_name,
                             "eval_job_id": job_id,
                         }
+                        if key_id:
+                            extra["key_id"] = key_id
                         if eval_max_conc is not None:
                             extra["eval_max_concurrency"] = str(eval_max_conc)
                         job_data = request_to_redis_job(
@@ -1250,7 +1264,14 @@ async def submit_evaluation(
         raise HTTPException(status_code=400, detail="'prepare_args' must be an object")
 
     # Submit evaluation job
-    job_id = await eval_manager.submit_eval(model, evals=evals, prepare_args=prepare_args)
+    principal = getattr(request.state, "auth_principal", None)
+    key_id = principal.get("id") if isinstance(principal, dict) else None
+    job_id = await eval_manager.submit_eval(
+        model,
+        evals=evals,
+        prepare_args=prepare_args,
+        key_id=key_id,
+    )
 
     return {
         "job_id": job_id,

@@ -3,7 +3,7 @@ import os, time, uuid, json, asyncio, subprocess, socket, collections, math, re,
 import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union, Any
-from fastapi import FastAPI, HTTPException, Response, Depends, APIRouter, Request, Query
+from fastapi import FastAPI, HTTPException, Response, Depends, APIRouter, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -46,6 +46,10 @@ REFILL_PER_SEC = float(os.getenv("TOKENS_REFILL_PER_SEC", "0.000555"))
 MAX_CONCURRENT_BATCH = int(os.getenv("MAX_CONCURRENT_BATCH", "64"))
 PREEMPT_CANCEL_TIMEOUT_S = float(os.getenv("PREEMPT_CANCEL_TIMEOUT_S", "3.0"))
 
+USAGE_HASH_PREFIX = os.getenv("USAGE_HASH_PREFIX", "key_usage:")
+USAGE_BUCKET_TTL_S = int(os.getenv("USAGE_BUCKET_TTL_S", str(90 * 86400)))
+ENABLE_USAGE_DAILY_BUCKETS = os.getenv("ENABLE_USAGE_DAILY_BUCKETS", "1") not in ("0", "false", "False")
+
 # Readiness timeouts (seconds)
 DEFAULT_READY_TIMEOUT_S = int(os.getenv("DEFAULT_READY_TIMEOUT_S", "120"))
 VLLM_READY_TIMEOUT_S = int(os.getenv("VLLM_READY_TIMEOUT_S", "900"))
@@ -78,6 +82,99 @@ state = {
     "last_warmup_ts": 0.0,
     "rt_cooldown_start_ts": 0.0,
 }
+
+
+def get_request_principal(request: Request) -> Optional[Dict[str, Any]]:
+    return getattr(request.state, "auth_principal", None)
+
+
+def _usage_hash_key(key_id: str, bucket: Optional[str] = None) -> str:
+    if bucket:
+        return f"{USAGE_HASH_PREFIX}{key_id}::{bucket}"
+    return f"{USAGE_HASH_PREFIX}{key_id}"
+
+
+async def _apply_usage_mutations(
+    hash_key: str,
+    *,
+    count_increments: Dict[str, int],
+    float_increments: Dict[str, float],
+    metadata: Dict[str, Any],
+    ttl: Optional[int] = None,
+):
+    if not redis:
+        return
+    pipe = redis.pipeline(transaction=False)
+    for field, delta in count_increments.items():
+        if delta:
+            pipe.hincrby(hash_key, field, delta)
+    for field, delta in float_increments.items():
+        if delta:
+            pipe.hincrbyfloat(hash_key, field, float(delta))
+    if metadata:
+        pipe.hset(hash_key, mapping={k: str(v) for k, v in metadata.items()})
+    if ttl:
+        pipe.expire(hash_key, ttl)
+    try:
+        await pipe.execute()
+    except Exception as exc:
+        log.warning("record_key_usage_failed", key=hash_key, error=str(exc))
+
+
+async def record_key_usage(
+    key_id: Optional[str],
+    *,
+    source: str,
+    scope: Optional[str],
+    model: Optional[str],
+    usage: Optional[Dict[str, Any]],
+    status: str,
+    metadata: Optional[Dict[str, Any]] = None,
+):
+    if not key_id or not redis:
+        return
+    now_ts = int(now())
+    counts = {"request_total": 1}
+    source_field = f"{source}_requests"
+    counts[source_field] = counts.get(source_field, 0) + 1
+    if status == "success":
+        counts["success_total"] = 1
+    else:
+        counts["error_total"] = 1
+    floats: Dict[str, float] = {}
+    if isinstance(usage, dict):
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            val = usage.get(field)
+            if isinstance(val, (int, float)):
+                floats[field] = floats.get(field, 0.0) + float(val)
+    info_fields: Dict[str, Any] = {
+        "last_ts": now_ts,
+        "last_status": status,
+        "last_source": source,
+    }
+    if scope:
+        info_fields["last_scope"] = scope
+    if model:
+        info_fields["last_model"] = model
+    if metadata:
+        info_fields.update({k: v for k, v in metadata.items() if v is not None})
+
+    await _apply_usage_mutations(
+        _usage_hash_key(key_id),
+        count_increments=counts,
+        float_increments=floats,
+        metadata=info_fields,
+    )
+
+    if ENABLE_USAGE_DAILY_BUCKETS:
+        bucket = time.strftime("%Y%m%d", time.gmtime(now_ts))
+        await _apply_usage_mutations(
+            _usage_hash_key(key_id, bucket=bucket),
+            count_increments=counts,
+            float_increments=floats,
+            metadata={"bucket": bucket, **info_fields},
+            ttl=USAGE_BUCKET_TTL_S,
+        )
 
 
 def _looks_like_runtime_oom(exit_code: int, logs: str, *, oom_killed: bool = False) -> bool:
@@ -190,13 +287,16 @@ def load_auth_keys_from_file(path: str) -> None:
         scopes = entry.get("scopes", [])
         if not kid or not token or not isinstance(scopes, list):
             continue
-        tmp[str(token)] = {"id": str(kid), "scopes": set(map(str, scopes))}
+        tmp[str(token)] = {"id": str(kid), "scopes": set(map(str, scopes)), "token": str(token)}
     if not tmp:
         raise RuntimeError("AUTH_KEYS_FILE contains no valid keys")
     AUTH_KEYS = tmp
 
 def make_require_scopes(required: set[str]):
-    async def _dep(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    async def _dep(
+        request: Request,
+        credentials: HTTPAuthorizationCredentials = Depends(security),
+    ):
         if not credentials or not credentials.credentials:
             raise HTTPException(status_code=401, detail="Missing authentication")
         token = credentials.credentials
@@ -206,7 +306,14 @@ def make_require_scopes(required: set[str]):
         scopes = principal.get("scopes", set())
         if not isinstance(scopes, set) or not required.issubset(scopes):
             raise HTTPException(status_code=403, detail="Insufficient scope")
-        return True
+        principal_copy = {
+            "id": principal.get("id"),
+            "scopes": scopes,
+            "token": principal.get("token", token),
+        }
+        request.state.auth_principal = principal_copy
+        return principal_copy
+
     return _dep
 
 # -------- Routers --------
@@ -811,31 +918,90 @@ async def http_health_ok(timeout_s: float = 3.0) -> bool:
     except Exception:
         return False
 
-async def runtime_proxy(endpoint: str, payload: dict, timeout=120, source: str = "unknown"):
-    """Proxy OpenAI-compatible requests directly to runtime.
-    Tracks inflight counts and last activity for transparency.
-    source: 'realtime' | 'batch' | 'unknown'
-    """
+async def runtime_proxy(
+    endpoint: str,
+    payload: dict,
+    timeout=120,
+    source: str = "unknown",
+    usage_context: Optional[Dict[str, Any]] = None,
+):
+    """Proxy OpenAI-compatible requests directly to runtime and optionally track usage."""
+
     from fastapi.responses import StreamingResponse
+
     runtime_host = get_runtime_host()
     url = f"http://{runtime_host}:{RUNTIME_PORT}{endpoint}"
+
+    async def _record_usage_if_needed(
+        usage_payload: Optional[Dict[str, Any]],
+        status: str,
+    ):
+        if not usage_context:
+            return
+        await record_key_usage(
+            usage_context.get("key_id"),
+            source=usage_context.get("source", source),
+            scope=usage_context.get("scope"),
+            model=usage_context.get("model") or payload.get("model"),
+            usage=usage_payload,
+            status=status,
+            metadata=usage_context.get("metadata"),
+        )
+
+    # Ensure streaming requests ask runtime to emit usage blocks
+    if payload.get("stream", False):
+        stream_options = payload.get("stream_options")
+        if isinstance(stream_options, dict):
+            if not stream_options.get("include_usage"):
+                stream_options = dict(stream_options)
+                stream_options["include_usage"] = True
+                payload["stream_options"] = stream_options
+        else:
+            payload["stream_options"] = {"include_usage": True}
+
     # Update inflight counters
     if source == "realtime":
         state["inflight_realtime"] = max(0, state.get("inflight_realtime", 0)) + 1
     elif source == "batch":
         state["inflight_batch"] = max(0, state.get("inflight_batch", 0)) + 1
     state["last_runtime_req_ts"] = now()
-    
-    # Check if this is a streaming request
+
     if payload.get("stream", False):
-        # For streaming, we need to proxy the stream
         async def stream_generator():
+            usage_payload: Optional[Dict[str, Any]] = None
+            remainder = ""
+            usage_recorded = False
+            track_usage = bool(usage_context)
+
+            def _process_chunk_text(text: str):
+                nonlocal remainder, usage_payload
+                remainder += text
+                while "\n\n" in remainder:
+                    event, remainder = remainder.split("\n\n", 1)
+                    if not event.strip():
+                        continue
+                    data_lines = []
+                    for line in event.split("\n"):
+                        line = line.strip("\r")
+                        if line.startswith("data:"):
+                            data_lines.append(line[5:].strip())
+                    if not data_lines:
+                        continue
+                    data_blob = "\n".join(data_lines).strip()
+                    if not data_blob or data_blob == "[DONE]":
+                        continue
+                    try:
+                        parsed = json.loads(data_blob)
+                    except Exception:
+                        continue
+                    if isinstance(parsed, dict) and isinstance(parsed.get("usage"), dict):
+                        usage_payload = parsed["usage"]
+
             try:
                 async with httpx.AsyncClient() as client:
                     async with client.stream("POST", url, json=payload, timeout=timeout) as r:
                         if r.status_code >= 400:
                             state["last_runtime_err_ts"] = now()
-                            error_payload: Any
                             try:
                                 error_payload = await r.aread()
                                 try:
@@ -844,47 +1010,76 @@ async def runtime_proxy(endpoint: str, payload: dict, timeout=120, source: str =
                                     error_payload = error_payload.decode("utf-8", errors="replace")
                             except Exception:
                                 error_payload = "stream_error"
+                            if not usage_recorded:
+                                await _record_usage_if_needed(None, status="error")
+                                usage_recorded = True
                             raise HTTPException(status_code=r.status_code, detail=error_payload)
                         async for chunk in r.aiter_bytes():
+                            if track_usage and chunk:
+                                try:
+                                    _process_chunk_text(chunk.decode("utf-8", errors="ignore"))
+                                except Exception:
+                                    pass
                             yield chunk
                 state["last_runtime_ok_ts"] = now()
             except HTTPException:
+                if not usage_recorded:
+                    await _record_usage_if_needed(None, status="error")
+                    usage_recorded = True
                 raise
             except Exception:
                 state["last_runtime_err_ts"] = now()
+                if not usage_recorded:
+                    await _record_usage_if_needed(None, status="error")
+                    usage_recorded = True
                 raise
+            else:
+                if not usage_recorded:
+                    await _record_usage_if_needed(usage_payload, status="success")
+                    usage_recorded = True
             finally:
                 if source == "realtime":
                     state["inflight_realtime"] = max(0, state.get("inflight_realtime", 0) - 1)
                 elif source == "batch":
                     state["inflight_batch"] = max(0, state.get("inflight_batch", 0) - 1)
-        
+
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
-    else:
-        # Non-streaming request
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.post(url, json=payload, timeout=timeout)
-                if r.status_code >= 400:
-                    state["last_runtime_err_ts"] = now()
-                    error_detail: Any
-                    try:
-                        error_detail = r.json()
-                    except Exception:
-                        error_detail = r.text
-                    raise HTTPException(status_code=r.status_code, detail=error_detail)
-                state["last_runtime_ok_ts"] = now()
-                return r.json()
-        except HTTPException:
-            raise
-        except Exception:
-            state["last_runtime_err_ts"] = now()
-            raise
-        finally:
-            if source == "realtime":
-                state["inflight_realtime"] = max(0, state.get("inflight_realtime", 0) - 1)
-            elif source == "batch":
-                state["inflight_batch"] = max(0, state.get("inflight_batch", 0) - 1)
+
+    # Non-streaming request
+    usage_recorded = False
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(url, json=payload, timeout=timeout)
+            if r.status_code >= 400:
+                state["last_runtime_err_ts"] = now()
+                try:
+                    error_detail: Any = r.json()
+                except Exception:
+                    error_detail = r.text
+                if not usage_recorded:
+                    await _record_usage_if_needed(None, status="error")
+                    usage_recorded = True
+                raise HTTPException(status_code=r.status_code, detail=error_detail)
+            state["last_runtime_ok_ts"] = now()
+            result = r.json()
+            if not usage_recorded:
+                usage_block = result.get("usage") if isinstance(result, dict) else None
+                await _record_usage_if_needed(usage_block, status="success")
+                usage_recorded = True
+            return result
+    except HTTPException:
+        raise
+    except Exception:
+        state["last_runtime_err_ts"] = now()
+        if not usage_recorded:
+            await _record_usage_if_needed(None, status="error")
+            usage_recorded = True
+        raise
+    finally:
+        if source == "realtime":
+            state["inflight_realtime"] = max(0, state.get("inflight_realtime", 0) - 1)
+        elif source == "batch":
+            state["inflight_batch"] = max(0, state.get("inflight_batch", 0) - 1)
 
 # ---------- prefetch (page-cache) ----------
 def prefetch_pagecache_blocking(model_id):
@@ -1755,9 +1950,96 @@ async def metrics(auth: bool = Depends(make_require_scopes({"monitor"}))):
     
     return Response(generate_latest(), media_type="text/plain")
 
+
+@app.get("/monitor/key_usage")
+async def monitor_key_usage(
+    limit: int = 100,
+    bucket: Optional[str] = None,
+    cursor: str = "0",
+    auth: bool = Depends(make_require_scopes({"monitor"})),
+):
+    """Return per-key usage aggregates for operators."""
+    if not redis:
+        return {"items": [], "cursor": "0", "bucket": bucket}
+    limit = max(1, min(limit, 500))
+    scan_cursor = 0
+    try:
+        scan_cursor = int(cursor)
+    except Exception:
+        scan_cursor = 0
+    pattern = f"{USAGE_HASH_PREFIX}*"
+    if bucket:
+        pattern = f"{USAGE_HASH_PREFIX}*::{bucket}"
+
+    def _as_int(val: Optional[str]) -> Optional[int]:
+        if val is None:
+            return None
+        try:
+            return int(float(val))
+        except Exception:
+            return None
+
+    def _as_float(val: Optional[str]) -> Optional[float]:
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    items = []
+    while True:
+        scan_cursor, keys = await redis.scan(scan_cursor, match=pattern, count=limit * 2)
+        for key in keys:
+            data = await redis.hgetall(key)
+            if not data:
+                continue
+            suffix = key[len(USAGE_HASH_PREFIX):]
+            key_bucket = None
+            key_id = suffix
+            if "::" in suffix:
+                key_id, key_bucket = suffix.split("::", 1)
+            entry = {
+                "key_id": key_id,
+                "bucket": key_bucket,
+                "request_total": _as_int(data.get("request_total")) or 0,
+                "realtime_requests": _as_int(data.get("realtime_requests")) or 0,
+                "batch_requests": _as_int(data.get("batch_requests")) or 0,
+                "success_total": _as_int(data.get("success_total")) or 0,
+                "error_total": _as_int(data.get("error_total")) or 0,
+                "prompt_tokens": _as_float(data.get("prompt_tokens")) or 0.0,
+                "completion_tokens": _as_float(data.get("completion_tokens")) or 0.0,
+                "total_tokens": _as_float(data.get("total_tokens")) or 0.0,
+                "last_model": data.get("last_model"),
+                "last_source": data.get("last_source"),
+                "last_scope": data.get("last_scope"),
+                "last_status": data.get("last_status"),
+                "last_ts": _as_float(data.get("last_ts")),
+            }
+            items.append(entry)
+            if len(items) >= limit:
+                break
+        if len(items) >= limit or scan_cursor == 0:
+            break
+    return {"items": items, "cursor": str(scan_cursor), "bucket": bucket}
+
 @v1_router.post("/completions")
-async def completions(req: CompletionRequest, response: Response, auth: bool = Depends(make_require_scopes({"realtime"}))):
+async def completions(
+    req: CompletionRequest,
+    response: Response,
+    request: Request,
+    auth: Dict[str, Any] = Depends(make_require_scopes({"realtime"})),
+):
     """OpenAI-compatible completions endpoint"""
+    principal = get_request_principal(request)
+    usage_context = None
+    if principal and principal.get("id"):
+        usage_context = {
+            "key_id": principal["id"],
+            "source": "realtime",
+            "scope": "realtime",
+            "metadata": {"endpoint": "/v1/completions"},
+        }
     # Update realtime arrival tracking for EWMA + hot TTL
     try:
         t_now = now()
@@ -1791,7 +2073,12 @@ async def completions(req: CompletionRequest, response: Response, auth: bool = D
             # Remove top_logprobs for completions
             if "top_logprobs" in payload:
                 payload.pop("top_logprobs", None)
-            return await runtime_proxy("/v1/completions", payload, source="realtime")
+            return await runtime_proxy(
+                "/v1/completions",
+                payload,
+                source="realtime",
+                usage_context=usage_context,
+            )
         except httpx.ConnectError as e:
             # Runtime is actually down
             log.error("completions_proxy_connect_error", error=str(e))
@@ -1827,8 +2114,22 @@ async def completions(req: CompletionRequest, response: Response, auth: bool = D
     }
 
 @v1_router.post("/chat/completions")
-async def chat_completions(req: ChatCompletionRequest, response: Response, auth: bool = Depends(make_require_scopes({"realtime"}))):
+async def chat_completions(
+    req: ChatCompletionRequest,
+    response: Response,
+    request: Request,
+    auth: Dict[str, Any] = Depends(make_require_scopes({"realtime"})),
+):
     """OpenAI-compatible chat completions endpoint"""
+    principal = get_request_principal(request)
+    usage_context = None
+    if principal and principal.get("id"):
+        usage_context = {
+            "key_id": principal["id"],
+            "source": "realtime",
+            "scope": "realtime",
+            "metadata": {"endpoint": "/v1/chat/completions"},
+        }
     # Update realtime arrival tracking for EWMA + hot TTL
     try:
         t_now = now()
@@ -1847,7 +2148,12 @@ async def chat_completions(req: ChatCompletionRequest, response: Response, auth:
     if state.get("current_model") == REALTIME_MODEL and is_runtime_ready():
         try:
             payload = req.dict(exclude_none=True)
-            return await runtime_proxy("/v1/chat/completions", payload, source="realtime")
+            return await runtime_proxy(
+                "/v1/chat/completions",
+                payload,
+                source="realtime",
+                usage_context=usage_context,
+            )
         except httpx.ConnectError as e:
             # Runtime is actually down
             log.error("chat_completions_proxy_connect_error", error=str(e))
@@ -1882,11 +2188,18 @@ async def chat_completions(req: ChatCompletionRequest, response: Response, auth:
     }
 
 @v1_router.post("/batch/completions")
-async def batch_completions(req: BatchCompletionRequest, response: Response, auth: bool = Depends(make_require_scopes({"batch"}))):
+async def batch_completions(
+    req: BatchCompletionRequest,
+    response: Response,
+    request: Request,
+    auth: Dict[str, Any] = Depends(make_require_scopes({"batch"})),
+):
     """Submit a batch completion request"""
     # Generate completion ID
     completion_id = f"cmpl-{uuid.uuid4().hex[:24]}"
     submit_ts = now()
+    principal = get_request_principal(request)
+    key_id = principal.get("id") if principal else None
     
     # Store in Redis with TTL of 7 days (604800 seconds)
     jobkey = JOB_HASH_PREFIX + completion_id
@@ -1912,6 +2225,8 @@ async def batch_completions(req: BatchCompletionRequest, response: Response, aut
         "submit_ts": str(submit_ts),
         "created": str(int(submit_ts))
     }
+    if key_id:
+        jobdata["key_id"] = key_id
     
     await redis.hset(jobkey, mapping=jobdata)
     await redis.expire(jobkey, 604800)  # 7 days TTL
@@ -1967,11 +2282,18 @@ async def get_batch_completion(completion_id: str, auth: bool = Depends(make_req
     return {"id": completion_id, "status": status}
 
 @v1_router.post("/batch/chat/completions")
-async def batch_chat_completions(req: BatchChatCompletionRequest, response: Response, auth: bool = Depends(make_require_scopes({"batch"}))):
+async def batch_chat_completions(
+    req: BatchChatCompletionRequest,
+    response: Response,
+    request: Request,
+    auth: Dict[str, Any] = Depends(make_require_scopes({"batch"})),
+):
     """Submit a batch chat completion request"""
     # Generate completion ID
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     submit_ts = now()
+    principal = get_request_principal(request)
+    key_id = principal.get("id") if principal else None
     
     # Store in Redis with TTL
     jobkey = JOB_HASH_PREFIX + completion_id
@@ -1997,6 +2319,8 @@ async def batch_chat_completions(req: BatchChatCompletionRequest, response: Resp
         "submit_ts": str(submit_ts),
         "created": str(int(submit_ts))
     }
+    if key_id:
+        jobdata["key_id"] = key_id
     
     await redis.hset(jobkey, mapping=jobdata)
     await redis.expire(jobkey, 604800)  # 7 days TTL
@@ -2052,10 +2376,16 @@ async def get_batch_chat_completion(completion_id: str, auth: bool = Depends(mak
 
 
 @v1_router.post("/jobs")
-async def submit_job(j: JobSubmit, auth: bool = Depends(make_require_scopes({"batch"}))):
+async def submit_job(
+    j: JobSubmit,
+    request: Request,
+    auth: Dict[str, Any] = Depends(make_require_scopes({"batch"})),
+):
     job_id = str(uuid.uuid4())
     submit_ts = now()
     jobkey = JOB_HASH_PREFIX + job_id
+    principal = get_request_principal(request)
+    key_id = principal.get("id") if principal else None
     jobdata = {
         "job_id": job_id,
         "model": j.model,
@@ -2065,6 +2395,8 @@ async def submit_job(j: JobSubmit, auth: bool = Depends(make_require_scopes({"ba
         "submit_ts": str(submit_ts),
         "status": "queued"
     }
+    if key_id:
+        jobdata["key_id"] = key_id
     await redis.hset(jobkey, mapping=jobdata)
     await redis.zadd(BATCH_ZSET, {job_id: submit_ts})
     # Clear prior failure on new submission for this model
@@ -2469,6 +2801,18 @@ async def batch_planner_loop():
 
                 job_type = jobh.get("type", "completion")
                 eval_name_local = jobh.get("eval_name") or None
+                key_id = jobh.get("key_id")
+                job_usage_context: Optional[Dict[str, Any]] = None
+                if key_id:
+                    metadata = {"job_id": jid}
+                    if eval_name_local:
+                        metadata["eval_name"] = eval_name_local
+                    job_usage_context = {
+                        "key_id": key_id,
+                        "source": "batch",
+                        "scope": "batch",
+                        "metadata": metadata,
+                    }
 
                 def _decode_json_field(val: Optional[str]):
                     if val is None or val == "" or val == "null":
@@ -2494,7 +2838,11 @@ async def batch_planner_loop():
                     except Exception:
                         return None
 
-                async def _call_with_retries(endpoint: str, request_data: dict):
+                async def _call_with_retries(
+                    endpoint: str,
+                    request_data: dict,
+                    usage_context: Optional[Dict[str, Any]] = None,
+                ):
                     """Call runtime with retries for eval jobs only; returns (result, error_info)."""
                     max_attempts = 4
                     base_backoff = 0.5
@@ -2502,7 +2850,12 @@ async def batch_planner_loop():
                     last_err = None
                     while attempt < max_attempts:
                         try:
-                            res = await runtime_proxy(endpoint, request_data, source="batch")
+                            res = await runtime_proxy(
+                                endpoint,
+                                request_data,
+                                source="batch",
+                                usage_context=usage_context,
+                            )
                             return res, None
                         except asyncio.CancelledError:
                             # Propagate cancellation immediately
@@ -2592,7 +2945,11 @@ async def batch_planner_loop():
                             guided_val = _decode_json_field(jobh.get(guided_key))
                             if guided_val is not None and guided_val != "":
                                 request_data[guided_key] = guided_val
-                        res, err = await _call_with_retries("/v1/completions", request_data)
+                        res, err = await _call_with_retries(
+                            "/v1/completions",
+                            request_data,
+                            usage_context=job_usage_context,
+                        )
                         if err is not None:
                             await redis.hset(JOB_HASH_PREFIX + jid, mapping={
                                 "status": "error",
@@ -2643,7 +3000,11 @@ async def batch_planner_loop():
                             guided_val = _decode_json_field(jobh.get(guided_key))
                             if guided_val is not None and guided_val != "":
                                 request_data[guided_key] = guided_val
-                        res, err = await _call_with_retries("/v1/chat/completions", request_data)
+                        res, err = await _call_with_retries(
+                            "/v1/chat/completions",
+                            request_data,
+                            usage_context=job_usage_context,
+                        )
                         if err is not None:
                             await redis.hset(JOB_HASH_PREFIX + jid, mapping={
                                 "status": "error",
@@ -2940,32 +3301,52 @@ async def tus_create(
 async def tus_head(
     upload_id: str,
     auth: bool = Depends(make_require_scopes({"upload"})),
-    tus_resumable: str = Header(TUS_VERSION)
+    tus_resumable: str = Header(..., alias="Tus-Resumable")
 ):
     """TUS resumption endpoint - returns current offset"""
+    if tus_resumable != TUS_VERSION:
+        return Response(
+            status_code=412,
+            headers={"Tus-Version": TUS_VERSION}
+        )
+
     upload_data = await redis.hgetall(f"upload:{upload_id}")
     if not upload_data:
         raise HTTPException(status_code=404)
     
-    return Response(
-        headers={
-            "Upload-Offset": upload_data["offset"],
-            "Upload-Length": upload_data["size"],
-            "Tus-Resumable": TUS_VERSION,
-            "Cache-Control": "no-store"
-        }
-    )
+    # Derive the truth from the on-disk file size and keep Redis in sync
+    temp_path = upload_data["temp_path"]
+    actual = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+    stored = int(upload_data.get("offset", 0))
+    if actual != stored:
+        try:
+            await redis.hset(f"upload:{upload_id}", "offset", str(actual))
+        except Exception:
+            pass
+
+    return Response(headers={
+        "Upload-Offset": str(actual),
+        "Upload-Length": upload_data["size"],
+        "Tus-Resumable": TUS_VERSION,
+        "Cache-Control": "no-store",
+    })
 
 @upload_router.patch("/upload/{upload_id}")
 async def tus_patch(
     upload_id: str,
     request: Request,
     auth: bool = Depends(make_require_scopes({"upload"})),
-    upload_offset: int = Header(...),
-    content_type: str = Header(...),
-    tus_resumable: str = Header(TUS_VERSION)
+    upload_offset: int = Header(..., alias="Upload-Offset"),
+    content_type: str = Header(..., alias="Content-Type"),
+    tus_resumable: str = Header(..., alias="Tus-Resumable"),
+    background_tasks: BackgroundTasks = None
 ):
     """TUS chunk upload endpoint"""
+    if tus_resumable != TUS_VERSION:
+        return Response(
+            status_code=412,
+            headers={"Tus-Version": TUS_VERSION}
+        )
     if content_type != "application/offset+octet-stream":
         raise HTTPException(status_code=415)
     
@@ -2973,32 +3354,56 @@ async def tus_patch(
     if not upload_data:
         raise HTTPException(status_code=404)
     
-    # Check offset matches
-    current_offset = int(upload_data["offset"])
-    if upload_offset != current_offset:
-        raise HTTPException(status_code=409, detail="Offset mismatch")
-    
-    # Read and append chunk
-    chunk = await request.body()
+    # Truth = file size; keep Redis consistent before comparing
     temp_path = upload_data["temp_path"]
-    
+    current_offset = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+    if str(current_offset) != upload_data.get("offset", "0"):
+        try:
+            await redis.hset(f"upload:{upload_id}", "offset", str(current_offset))
+        except Exception:
+            pass
+
+    # If client is behind/ahead, tell them where to resume
+    if upload_offset != current_offset:
+        return Response(
+            status_code=409,
+            headers={
+                "Upload-Offset": str(current_offset),
+                "Tus-Resumable": TUS_VERSION,
+            },
+        )
+
+    # Read the chunk
+    chunk = await request.body()
+    total = int(upload_data["size"])
+
+    # Guard: don't allow overflow beyond declared Upload-Length
+    if upload_offset + len(chunk) > total:
+        return Response(status_code=413)
+
+    # Append
     async with aiofiles.open(temp_path, "ab") as f:
         await f.write(chunk)
-    
     new_offset = current_offset + len(chunk)
-    await redis.hset(f"upload:{upload_id}", "offset", str(new_offset))
-    
-    # Check if complete
-    if new_offset >= int(upload_data["size"]):
-        await _finalize_upload(upload_id, upload_data)
-    
-    return Response(
-        status_code=204,
-        headers={
-            "Upload-Offset": str(new_offset),
-            "Tus-Resumable": TUS_VERSION
-        }
-    )
+
+    # Persist new offset (best-effort)
+    try:
+        await redis.hset(f"upload:{upload_id}", "offset", str(new_offset))
+    except Exception:
+        pass
+
+    # If complete, finalize asynchronously so we can return immediately
+    if new_offset >= total:
+        if background_tasks is not None:
+            background_tasks.add_task(_finalize_upload, upload_id, upload_data)
+        else:
+            # Fallback (shouldn't happen under FastAPI, but harmless)
+            asyncio.create_task(_finalize_upload(upload_id, upload_data))
+
+    return Response(status_code=204, headers={
+        "Upload-Offset": str(new_offset),
+        "Tus-Resumable": TUS_VERSION,
+    })
 
 async def _finalize_upload(upload_id: str, upload_data: dict):
     """Extract and install uploaded model"""
