@@ -2,7 +2,7 @@ services:
   redis:
     image: redis:8.2
     volumes:
-      - redis-data:/data
+      - ./data/redis:/data
     command: ["redis-server", "--appendonly", "yes"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -68,6 +68,3 @@ services:
       start_period: 10s
     # Add --reload flag for auto-reload on code changes
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"]
-
-volumes:
-  redis-data:
