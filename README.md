@@ -21,6 +21,7 @@ Services (listening on `0.0.0.0`): API `http://<host>:8000`, UI `http://<host>:8
 | `RUNTIME_TYPE` | `vllm` (default) or `sglang`; controls runtime image/args |
 | `RUNTIME_IMAGE`, `RUNTIME_ARGS` | Docker image and CLI args passed to `llm_runtime` |
 | `REALTIME_MODEL` | Model to keep hot for `/v1/completions` & `/v1/chat/completions` |
+| `AUTH_KEYS_WATCH_INTERVAL_S` | Poll interval (seconds) for auto-reloading `config/auth.keys.json` |
 | `MAX_CONCURRENT_BATCH` | Upper bound on simultaneous batch requests |
 | `AUTH_KEYS_FILE` | Container path to scoped key JSON (mounted via Compose) |
 | `EUROEVAL_DEBUG_LOG` | Optional path for EuroEval adapter debug output |
@@ -36,7 +37,7 @@ Update `.env` and restart the orchestrator container to apply changes.
 | `upload` | `/v1/upload/*` TUS endpoints |
 | `monitor` | `/dashboard`, `/metrics`, queue/eval UI JSON |
 
-Scopes load once at startup; restart the container after editing `config/auth.keys.json`.
+Scopes hot-reload automatically when `config/auth.keys.json` changes (no container restart needed just for key edits).
 
 ## Usage Tracking
 - Every authenticated realtime or batch inference call updates per-key counters (requests, successes/errors, prompt/completion tokens) stored in Redis hashes under `key_usage:<key_id>`.

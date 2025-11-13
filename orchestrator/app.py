@@ -1,5 +1,6 @@
 # orchestrator/app.py
 import os, time, uuid, json, asyncio, subprocess, socket, collections, math, re, random, hashlib
+import contextlib
 import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union, Any
@@ -49,6 +50,10 @@ PREEMPT_CANCEL_TIMEOUT_S = float(os.getenv("PREEMPT_CANCEL_TIMEOUT_S", "3.0"))
 USAGE_HASH_PREFIX = os.getenv("USAGE_HASH_PREFIX", "key_usage:")
 USAGE_BUCKET_TTL_S = int(os.getenv("USAGE_BUCKET_TTL_S", str(90 * 86400)))
 ENABLE_USAGE_DAILY_BUCKETS = os.getenv("ENABLE_USAGE_DAILY_BUCKETS", "1") not in ("0", "false", "False")
+try:
+    AUTH_KEYS_WATCH_INTERVAL_S = max(0.5, float(os.getenv("AUTH_KEYS_WATCH_INTERVAL_S", "1.5")))
+except Exception:
+    AUTH_KEYS_WATCH_INTERVAL_S = 1.5
 
 # Readiness timeouts (seconds)
 DEFAULT_READY_TIMEOUT_S = int(os.getenv("DEFAULT_READY_TIMEOUT_S", "120"))
@@ -61,6 +66,8 @@ MODEL_META_PREFIX = "model:"
 CONTAINER_NAME = "llm_runtime"
 
 app = FastAPI()
+app.state.planner_task = None
+app.state.auth_keys_watch_task = None
 redis = None
 docker_client = docker.from_env()
 
@@ -266,6 +273,7 @@ security = HTTPBearer(auto_error=False)
 
 # In-memory key store: token -> {"id": str, "scopes": set[str]}
 AUTH_KEYS: Dict[str, Dict[str, Union[str, set[str]]]] = {}
+AUTH_KEYS_LAST_MTIME: Optional[float] = None
 
 def load_auth_keys_from_file(path: str) -> None:
     """Load scoped auth keys from a JSON file.
@@ -292,6 +300,55 @@ def load_auth_keys_from_file(path: str) -> None:
         raise RuntimeError("AUTH_KEYS_FILE contains no valid keys")
     AUTH_KEYS = tmp
 
+def _get_auth_keys_mtime(path: Optional[str]) -> Optional[float]:
+    if not path:
+        return None
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+async def _watch_auth_keys_file():
+    """Poll AUTH_KEYS_FILE for changes and hot-reload when it updates."""
+    global AUTH_KEYS_LAST_MTIME
+    path = AUTH_KEYS_FILE
+    if not path:
+        log.warning("auth_keys_watch_disabled_no_path")
+        return
+    interval = AUTH_KEYS_WATCH_INTERVAL_S
+    log.info("auth_keys_watch_started", path=path, interval_s=interval)
+    try:
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                current_mtime = _get_auth_keys_mtime(path)
+                if current_mtime is None:
+                    if AUTH_KEYS_LAST_MTIME is not None:
+                        log.warning("auth_keys_file_missing", path=path)
+                        AUTH_KEYS_LAST_MTIME = None
+                    continue
+                if AUTH_KEYS_LAST_MTIME is None:
+                    AUTH_KEYS_LAST_MTIME = current_mtime
+                    continue
+                if current_mtime != AUTH_KEYS_LAST_MTIME:
+                    # Small delay allows writers to finish file replacements
+                    await asyncio.sleep(0.05)
+                    try:
+                        load_auth_keys_from_file(path)
+                        AUTH_KEYS_LAST_MTIME = current_mtime
+                        log.info("auth_keys_hot_reloaded", path=path)
+                    except Exception as exc:
+                        log.warning("auth_keys_reload_failed", error=str(exc), path=path)
+            except asyncio.CancelledError:
+                raise
+            except Exception as inner_exc:
+                log.warning("auth_keys_watch_error", error=str(inner_exc))
+                await asyncio.sleep(max(1.0, interval))
+    except asyncio.CancelledError:
+        log.info("auth_keys_watch_stopped")
+    except Exception as exc:
+        log.error("auth_keys_watch_crashed", error=str(exc))
+        raise
 def make_require_scopes(required: set[str]):
     async def _dep(
         request: Request,
@@ -1342,8 +1399,11 @@ async def proactive_storage_management():
 # ---------- API & job endpoints ----------
 @app.on_event("startup")
 async def startup():
+    global AUTH_KEYS_LAST_MTIME
     # Load scoped auth keys upfront
     load_auth_keys_from_file(AUTH_KEYS_FILE)
+    AUTH_KEYS_LAST_MTIME = _get_auth_keys_mtime(AUTH_KEYS_FILE)
+    app.state.auth_keys_watch_task = asyncio.create_task(_watch_auth_keys_file())
 
     await redis_connect()
     
@@ -1547,6 +1607,11 @@ async def shutdown():
     if app.state.planner_task:
         app.state.planner_task.cancel()
         await asyncio.sleep(0.1)
+    watch_task = getattr(app.state, "auth_keys_watch_task", None)
+    if watch_task:
+        watch_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watch_task
 
 # ---------- UI Endpoints ----------
 @ui_router.get("/dashboard", response_class=HTMLResponse)
