@@ -2,6 +2,8 @@ import os
 import json
 from typing import Any
 
+CHAT_TEMPLATE_FILENAMES = ("chat_template.jinja",)
+
 
 def _load_json(path: str) -> dict | None:
     try:
@@ -44,6 +46,20 @@ def _ensure_tokenizer_files(model_id: str) -> None:
     except Exception:
         # Ignore download errors here; detection will fall back to name heuristics
         return
+
+
+def _has_standalone_chat_template(snapshot_dir: str) -> bool:
+    for name in CHAT_TEMPLATE_FILENAMES:
+        path = os.path.join(snapshot_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                if f.read().strip():
+                    return True
+        except Exception:
+            continue
+    return False
 
 
 def detect_is_base_model(model_id: str) -> bool:
@@ -104,11 +120,12 @@ def detect_is_base_model(model_id: str) -> bool:
         for snap in candidates:
             cfg = _load_json(os.path.join(snap, "tokenizer_config.json"))
             if cfg is None:
-                continue
-            if "chat_template" in cfg:
-                tmpl = cfg.get("chat_template")
-                if isinstance(tmpl, str) and tmpl.strip():
-                    return False  # instruct/chat model
+                cfg = {}
+            tmpl = cfg.get("chat_template")
+            if isinstance(tmpl, str) and tmpl.strip():
+                return False  # instruct/chat model
+            if _has_standalone_chat_template(snap):
+                return False
 
         # No instruct signal found in available snapshots.
         if os.path.isdir(snapshots_dir):
@@ -128,6 +145,8 @@ def detect_is_base_model(model_id: str) -> bool:
             for snap in snaps:
                 cfg = _load_json(os.path.join(snap, "tokenizer_config.json"))
                 if cfg and isinstance(cfg.get("chat_template"), str) and cfg.get("chat_template").strip():
+                    return False
+                if _has_standalone_chat_template(snap):
                     return False
             return True
         # Cache still missing; default to base per simplified rule
