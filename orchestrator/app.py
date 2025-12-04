@@ -1125,7 +1125,26 @@ async def runtime_proxy(
                             if not usage_recorded:
                                 await _record_usage_if_needed(None, status="error")
                                 usage_recorded = True
-                            raise HTTPException(status_code=r.status_code, detail=error_payload)
+                            error_id = f"rt-{uuid.uuid4().hex[:8]}"
+                            log.error(
+                                "runtime_stream_error",
+                                error_id=error_id,
+                                endpoint=endpoint,
+                                status_code=r.status_code,
+                                error=error_payload,
+                                model=payload.get("model"),
+                            )
+                            raise HTTPException(
+                                status_code=r.status_code,
+                                detail={
+                                    "error": "runtime_stream_error",
+                                    "error_id": error_id,
+                                    "upstream_status": r.status_code,
+                                    "upstream_error": error_payload,
+                                    "endpoint": endpoint,
+                                    "model": payload.get("model"),
+                                },
+                            )
                         async for chunk in r.aiter_bytes():
                             if track_usage and chunk:
                                 try:
@@ -1168,18 +1187,28 @@ async def runtime_proxy(
                     error_detail: Any = r.json()
                 except Exception:
                     error_detail = r.text
-                # Log rich context for visibility into runtime failures
-                log.error(
-                    "runtime_nonstream_error",
-                    endpoint=endpoint,
-                    status_code=r.status_code,
-                    error=error_detail,
-                    payload=payload,
-                )
                 if not usage_recorded:
                     await _record_usage_if_needed(None, status="error")
                     usage_recorded = True
-                raise HTTPException(status_code=r.status_code, detail=error_detail)
+                error_id = f"rt-{uuid.uuid4().hex[:8]}"
+                # Log rich context for visibility into runtime failures
+                log.error(
+                    "runtime_nonstream_error",
+                    error_id=error_id,
+                    endpoint=endpoint,
+                    status_code=r.status_code,
+                    error=error_detail,
+                    model=payload.get("model"),
+                )
+                detail: dict[str, Any] = {
+                    "error": "runtime_error",
+                    "error_id": error_id,
+                    "upstream_status": r.status_code,
+                    "upstream_error": error_detail,
+                    "endpoint": endpoint,
+                    "model": payload.get("model"),
+                }
+                raise HTTPException(status_code=r.status_code, detail=detail)
             state["last_runtime_ok_ts"] = now()
             result = r.json()
             if not usage_recorded:
@@ -1189,12 +1218,31 @@ async def runtime_proxy(
             return result
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
+        # Network/serialization or other unexpected proxy-layer failure
         state["last_runtime_err_ts"] = now()
+        error_id = f"rt-{uuid.uuid4().hex[:8]}"
+        log.error(
+            "runtime_proxy_exception",
+            error_id=error_id,
+            endpoint=endpoint,
+            error=str(e) or repr(e),
+            error_type=type(e).__name__,
+            model=payload.get("model"),
+            max_tokens=payload.get("max_tokens"),
+            stream=payload.get("stream"),
+        )
         if not usage_recorded:
             await _record_usage_if_needed(None, status="error")
             usage_recorded = True
-        raise
+        detail: Dict[str, Any] = {
+            "error": "runtime_proxy_error",
+            "error_id": error_id,
+            "message": str(e) or repr(e),
+            "endpoint": endpoint,
+            "model": payload.get("model"),
+        }
+        raise HTTPException(status_code=500, detail=detail)
     finally:
         if source == "realtime":
             state["inflight_realtime"] = max(0, state.get("inflight_realtime", 0) - 1)
@@ -2181,7 +2229,15 @@ async def completions(
     # Check if request is for realtime model
     if req.model != REALTIME_MODEL:
         # If not realtime model, could enqueue as batch or reject
-        raise HTTPException(status_code=400, detail=f"Model {req.model} not available for realtime. Use /v1/jobs for batch processing.")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "model_not_available",
+                "message": f"Model '{req.model}' not available for realtime on this endpoint.",
+                "requested_model": req.model,
+                "available_realtime_model": REALTIME_MODEL,
+            },
+        )
     
     # Check if realtime model is hot
     if state.get("current_model") == REALTIME_MODEL and is_runtime_ready():
@@ -2207,6 +2263,9 @@ async def completions(
                 source="realtime",
                 usage_context=usage_context,
             )
+        except HTTPException as e:
+            # Preserve upstream HTTPException details (including structured runtime error info)
+            raise e
         except httpx.ConnectError as e:
             # Runtime is actually down
             log.error("completions_proxy_connect_error", error=str(e))
@@ -2214,8 +2273,24 @@ async def completions(
             # Fall through to cold start
         except Exception as e:
             # Request-level error, runtime is still up
-            log.error("completions_proxy_error", error=str(e))
-            raise HTTPException(status_code=500, detail=str(e))
+            error_id = f"rt-{uuid.uuid4().hex[:8]}"
+            log.error(
+                "completions_proxy_error",
+                error_id=error_id,
+                error=str(e) or repr(e),
+                error_type=type(e).__name__,
+                model=req.model,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "gateway_proxy_error",
+                    "error_id": error_id,
+                    "message": str(e) or repr(e),
+                    "endpoint": "/v1/completions",
+                    "model": req.model,
+                },
+            )
     
     # Model needs to be loaded - return 503 with dynamic Retry-After
     # Initialize cooldown start if not set yet
@@ -2270,7 +2345,15 @@ async def chat_completions(
         pass
     # Check if request is for realtime model
     if req.model != REALTIME_MODEL:
-        raise HTTPException(status_code=400, detail=f"Model {req.model} not available for realtime. Use /v1/jobs for batch processing.")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "model_not_available",
+                "message": f"Model '{req.model}' not available for realtime on this endpoint.",
+                "requested_model": req.model,
+                "available_realtime_model": REALTIME_MODEL,
+            },
+        )
     
     # Check if realtime model is hot
     if state.get("current_model") == REALTIME_MODEL and is_runtime_ready():
@@ -2278,10 +2361,13 @@ async def chat_completions(
             payload = req.dict(exclude_none=True)
             return await runtime_proxy(
                 "/v1/chat/completions",
-            payload,
-            source="realtime",
-            usage_context=usage_context,
+                payload,
+                source="realtime",
+                usage_context=usage_context,
             )
+        except HTTPException as e:
+            # Preserve upstream HTTPException details (including structured runtime error info)
+            raise e
         except httpx.ConnectError as e:
             # Runtime is actually down
             log.error("chat_completions_proxy_connect_error", error=str(e))
@@ -2290,14 +2376,27 @@ async def chat_completions(
         except Exception as e:
             # Request-level error, runtime is still up
             err_detail = getattr(e, "detail", None)
+            error_id = f"rt-{uuid.uuid4().hex[:8]}"
             log.error(
                 "chat_completions_proxy_error",
+                error_id=error_id,
                 error=str(e) or repr(e),
                 error_type=type(e).__name__,
                 detail=err_detail,
-                payload=payload,
+                model=req.model,
+                max_tokens=payload.get("max_tokens"),
+                messages_count=len(payload.get("messages", [])),
             )
-            raise HTTPException(status_code=500, detail=str(e) or "runtime_proxy_error")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "gateway_proxy_error",
+                    "error_id": error_id,
+                    "message": str(e) or "runtime_proxy_error",
+                    "endpoint": "/v1/chat/completions",
+                    "model": req.model,
+                },
+            )
 
     # Model needs to be loaded - return 503 with dynamic Retry-After
     if not state.get("rt_cooldown_start_ts"):
