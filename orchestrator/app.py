@@ -1239,7 +1239,7 @@ async def runtime_proxy(
             "message": (
                 f"Request to runtime timed out after {timeout}s. "
                 "The model may be overloaded due to high GPU utilization or processing "
-                f"a large batch of concurrent requests. Original error: {e}"
+                "a large batch of concurrent requests."
             ),
             "endpoint": endpoint,
             "model": payload.get("model"),
