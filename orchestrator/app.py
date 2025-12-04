@@ -1218,6 +1218,33 @@ async def runtime_proxy(
             return result
     except HTTPException:
         raise
+    except httpx.TimeoutException as e:
+        # Request timed out - likely due to high GPU load
+        state["last_runtime_err_ts"] = now()
+        error_id = f"rt-{uuid.uuid4().hex[:8]}"
+        log.error(
+            "runtime_proxy_timeout",
+            error_id=error_id,
+            endpoint=endpoint,
+            timeout_s=timeout,
+            error=str(e),
+            model=payload.get("model"),
+        )
+        if not usage_recorded:
+            await _record_usage_if_needed(None, status="error")
+            usage_recorded = True
+        detail: Dict[str, Any] = {
+            "error": "runtime_proxy_timeout",
+            "error_id": error_id,
+            "message": (
+                f"Request to runtime timed out after {timeout}s. "
+                "The model may be overloaded due to high GPU utilization or processing "
+                f"a large batch of concurrent requests. Original error: {e}"
+            ),
+            "endpoint": endpoint,
+            "model": payload.get("model"),
+        }
+        raise HTTPException(status_code=500, detail=detail)
     except Exception as e:
         # Network/serialization or other unexpected proxy-layer failure
         state["last_runtime_err_ts"] = now()
