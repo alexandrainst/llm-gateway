@@ -26,6 +26,23 @@ except Exception:  # pragma: no cover
 import subprocess
 import re
 
+REASONING_END_TOKENS = ("</think>", "</reason>", "</reasoning>", "</analysis>", "</chain_of_thought>")
+REASONING_START_TOKENS = ("<think>", "<reason>", "<reasoning>", "<analysis>", "<chain_of_thought>")
+
+
+def _strip_reasoning_content(text: str | None) -> str:
+    if not text:
+        return ""
+    lowered = text.lower()
+    for marker in REASONING_END_TOKENS:
+        idx = lowered.rfind(marker)
+        if idx != -1:
+            return text[idx + len(marker):].lstrip()
+    for marker in REASONING_START_TOKENS:
+        if marker in lowered:
+            return ""
+    return text
+
 
 # Paths within this eval module
 THIS_DIR = Path(__file__).parent
@@ -214,6 +231,7 @@ def _write_predictions_for_slice(pred_dir: Path, task: str, requests: List[Dict[
                             text = choice.get("text", "") or ""
                 except Exception:
                     text = ""
+            text = _strip_reasoning_content(text)
 
             # Ground-truth references from dataset if provided
             outs = []

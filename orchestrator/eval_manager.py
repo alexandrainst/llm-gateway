@@ -13,7 +13,7 @@ from pathlib import Path
 import shutil
 from typing import Dict, List, Optional, Any
 from enum import Enum
-from model_utils import detect_is_base_model
+from model_utils import CHAT_TEMPLATE_FILENAMES, detect_is_base_model
 import structlog
 from fastapi import APIRouter, HTTPException, Depends, Request
 import math
@@ -21,6 +21,9 @@ import math
 logger = structlog.get_logger()
 
 INTERNAL_EVAL_KEY_ID = os.getenv("INTERNAL_EVAL_KEY_ID", "__internal_eval__")
+REASONING_MAX_TOKENS = int(os.getenv("REASONING_MAX_TOKENS", "8192"))
+REASONING_MARKERS = tuple(m.lower() for m in ("<think", "<reason", "<reasoning", "<analysis", "<chain_of_thought"))
+BATCH_ZSET = "z:batchjobs"
 
 
 async def run_eval_command(eval_name: str, eval_repo_path: Path, cmd_args: List[str], 
@@ -346,6 +349,10 @@ class EvalManager:
         self.eval_repo_path = os.getenv("EVAL_REPO_PATH", "/home/alex-admin/llm-gateway/eval-repo")
         self.data_dir = Path("/data/eval_results")
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.reasoning_cache: Dict[str, bool] = {}
+        self.reasoning_locks: Dict[str, asyncio.Lock] = {}
+        self.reasoning_max_tokens = REASONING_MAX_TOKENS
+        self.submission_in_progress: int = 0
         
         # Track active evaluations
         self.active_evals: Dict[str, asyncio.Task] = {}
@@ -356,6 +363,7 @@ class EvalManager:
         evals: List[str] | None = None,
         prepare_args: Dict | None = None,
         key_id: Optional[str] = None,
+        is_base_override: Optional[bool] = None,
     ) -> str:
         """
         Submit a model for evaluation.
@@ -382,6 +390,7 @@ class EvalManager:
             "requested_evals": evals or [],
             "prepare_args": prepare_args or {},
             "key_id": effective_key_id,
+            "is_base_override": is_base_override,
         }
         
         # Store in Redis with 30 day TTL
@@ -408,6 +417,7 @@ class EvalManager:
     
     async def _run_eval(self, job_id: str, model: str):
         """Run the full evaluation workflow."""
+        self.submission_in_progress += 1
         try:
             # Update status to submitting
             await self._update_job_status(job_id, EvalStatus.SUBMITTING)
@@ -444,11 +454,18 @@ class EvalManager:
         finally:
             # Clean up from active evals
             self.active_evals.pop(job_id, None)
+            self.submission_in_progress = max(0, self.submission_in_progress - 1)
     
-    async def _check_is_base_model(self, model: str) -> bool:
-        """Detect base vs instruction. Runs in a thread to avoid blocking the event loop.
+    async def _check_is_base_model(self, model: str, override: Optional[bool] = None) -> bool:
+        """Detect base vs instruction.
+
+        If override is provided (True=base, False=instruct), use that.
+        Otherwise runs detection in a thread to avoid blocking the event loop.
         Also ensures minimal tokenizer/config files are fetched into the cache if missing.
         """
+        if override is not None:
+            logger.info("model_type_override", model=model, is_base=override)
+            return override
         try:
             loop = asyncio.get_running_loop()
             is_base = await loop.run_in_executor(None, detect_is_base_model, model)
@@ -457,6 +474,210 @@ class EvalManager:
         except Exception as e:
             logger.warning(f"Detection error for {model}: {e}; defaulting to instruct")
             return False
+
+    def _get_reasoning_lock(self, model: str) -> asyncio.Lock:
+        lock = self.reasoning_locks.get(model)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.reasoning_locks[model] = lock
+        return lock
+
+    @staticmethod
+    def _extract_choice_text(choice: Dict[str, Any]) -> str:
+        if not isinstance(choice, dict):
+            return ""
+        if "message" in choice and isinstance(choice["message"], dict):
+            content = choice["message"].get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        if "text" in item:
+                            parts.append(str(item.get("text", "")))
+                        elif "content" in item:
+                            parts.append(str(item.get("content", "")))
+                return "".join(parts)
+        text = choice.get("text")
+        if isinstance(text, str):
+            return text
+        return ""
+
+    @staticmethod
+    def _contains_reasoning_markers(text: str) -> bool:
+        lowered = text.lower()
+        return any(marker in lowered for marker in REASONING_MARKERS)
+
+    @staticmethod
+    def _prompt_contains_reasoning(request: Dict[str, Any]) -> bool:
+        """Check if the request prompt/messages already include reasoning markers (e.g., chat template inserts <think>)."""
+        try:
+            msgs = request.get("messages")
+            if isinstance(msgs, list):
+                for m in msgs:
+                    if not isinstance(m, dict):
+                        continue
+                    content = m.get("content")
+                    if isinstance(content, str) and EvalManager._contains_reasoning_markers(content):
+                        return True
+                    if isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict):
+                                txt = part.get("text") or part.get("content")
+                                if isinstance(txt, str) and EvalManager._contains_reasoning_markers(txt):
+                                    return True
+            prompt = request.get("prompt")
+            if isinstance(prompt, str) and EvalManager._contains_reasoning_markers(prompt):
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _template_has_reasoning_markers(self, model: str) -> bool:
+        """Check cached chat templates for reasoning markers (e.g., <think> prefilled by template)."""
+        try:
+            cache_root = "/host_hf_cache"
+            base_dir = os.path.join(cache_root, "hub", f"models--{model.replace('/', '--')}")
+            snapshots_dir = os.path.join(base_dir, "snapshots")
+            candidates: list[str] = []
+            if os.path.isdir(snapshots_dir):
+                main_dir = os.path.join(snapshots_dir, "main")
+                if os.path.isdir(main_dir):
+                    candidates.append(main_dir)
+                hashed = []
+                for name in os.listdir(snapshots_dir):
+                    if name == "main":
+                        continue
+                    p = os.path.join(snapshots_dir, name)
+                    if os.path.isdir(p):
+                        try:
+                            hashed.append((os.path.getmtime(p), p))
+                        except Exception:
+                            hashed.append((0, p))
+                hashed.sort(key=lambda x: x[0], reverse=True)
+                candidates.extend([p for _, p in hashed])
+            for snap in candidates:
+                # tokenizer_config.json inline chat_template
+                try:
+                    with open(os.path.join(snap, "tokenizer_config.json"), "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    tmpl = cfg.get("chat_template")
+                    if isinstance(tmpl, str) and tmpl.strip():
+                        if self._contains_reasoning_markers(tmpl):
+                            return True
+                except Exception:
+                    pass
+                # standalone chat_template files
+                for fname in CHAT_TEMPLATE_FILENAMES:
+                    path = os.path.join(snap, fname)
+                    if not os.path.isfile(path):
+                        continue
+                    try:
+                        txt = open(path, "r", encoding="utf-8").read()
+                    except Exception:
+                        txt = ""
+                    if txt and self._contains_reasoning_markers(txt):
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def _result_contains_reasoning(self, result_json: Optional[str]) -> bool:
+        if not result_json:
+            return False
+        try:
+            payload = json.loads(result_json)
+        except Exception:
+            return False
+        choices = payload.get("choices")
+        if not isinstance(choices, list):
+            return False
+        for choice in choices:
+            text = self._extract_choice_text(choice)
+            if text and self._contains_reasoning_markers(text):
+                return True
+        return False
+
+    async def _detect_reasoning_model(self, model: str, *, is_base_model: bool) -> bool:
+        if is_base_model or not self.redis:
+            return False
+        cached = self.reasoning_cache.get(model)
+        if cached is not None:
+            return cached
+        lock = self._get_reasoning_lock(model)
+        async with lock:
+            cached = self.reasoning_cache.get(model)
+            if cached is not None:
+                return cached
+            # Check chat template for prefilled reasoning markers (e.g., <think>)
+            if self._template_has_reasoning_markers(model):
+                self.reasoning_cache[model] = True
+                logger.info("reasoning_model_detected_from_template", model=model)
+                return True
+            comp_id = f"probe_{uuid.uuid4().hex[:10]}"
+            request = {
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "State a single fun fact in one concise sentence."},
+                ],
+                "max_tokens": 64,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "n": 1,
+                "priority": 999,
+            }
+            job_key = f"job:{comp_id}"
+            job_data = request_to_redis_job(
+                request,
+                model,
+                comp_id,
+                eval_name="__reasoning_probe__",
+                key_id=INTERNAL_EVAL_KEY_ID,
+            )
+            await self.redis.hset(job_key, mapping=job_data)
+            await self.redis.expire(job_key, 3600)
+            await self.redis.zadd(BATCH_ZSET, {comp_id: datetime.utcnow().timestamp()})
+            reasoning = False
+            poll_delay = 0.5
+            max_delay = 5.0
+            loop = asyncio.get_running_loop()
+            last_log_ts = 0.0
+            while True:
+                data = await self.redis.hgetall(job_key)
+                if not data:
+                    logger.warning("reasoning_probe_missing_job", model=model)
+                    break
+                status = data.get("status")
+                if status == "completed":
+                    # First, if the prompt already contained reasoning markers (e.g., chat template inserted <think>),
+                    # treat this model as reasoning-enabled even if the output omits them.
+                    if self._prompt_contains_reasoning(redis_job_to_request(data)):  # type: ignore[arg-type]
+                        reasoning = True
+                    else:
+                        reasoning = self._result_contains_reasoning(data.get("result"))
+                    break
+                if status in {"error", "failed"}:
+                    logger.warning("reasoning_probe_failed", model=model, status=status)
+                    break
+                now_ts = loop.time()
+                if now_ts - last_log_ts >= 60.0:
+                    logger.info("reasoning_probe_waiting", model=model, status=status or "pending")
+                    last_log_ts = now_ts
+                await asyncio.sleep(poll_delay)
+                poll_delay = min(max_delay, poll_delay * 1.5)
+            self.reasoning_cache[model] = reasoning
+            if reasoning:
+                logger.info("reasoning_model_detected", model=model)
+            else:
+                logger.info("reasoning_model_not_detected", model=model)
+            # Short TTL on probe job to avoid clutter once we're done
+            try:
+                await self.redis.expire(job_key, 300)
+                await self.redis.zrem(BATCH_ZSET, comp_id)
+            except Exception:
+                pass
+            return reasoning
     
     async def _submit_requests(self, job_id: str, model: str) -> Optional[Dict]:
         """
@@ -475,8 +696,20 @@ class EvalManager:
         requested_evals = job_cfg.get("requested_evals") or []
         prepare_args = job_cfg.get("prepare_args") or {}
         key_id = job_cfg.get("key_id") or INTERNAL_EVAL_KEY_ID
+        base_override = job_cfg.get("is_base_override")
+        if isinstance(base_override, bool):
+            base_override_bool: Optional[bool] = base_override
+        else:
+            base_override_bool = None
         # Check if model is a base model
-        is_base_model = await self._check_is_base_model(model)
+        is_base_model = await self._check_is_base_model(model, override=base_override_bool)
+        reasoning_model = await self._detect_reasoning_model(model, is_base_model=is_base_model)
+        logger.info(
+            "eval_model_characteristics",
+            model=model,
+            is_base=is_base_model,
+            reasoning_mode=reasoning_model,
+        )
         
         # Determine evals to run: overrides or defaults from repo list
         if requested_evals:
@@ -510,6 +743,7 @@ class EvalManager:
             "model": model,
             "timestamp": datetime.utcnow().isoformat(),
             "eval_suite": "standard",
+            "reasoning_model": reasoning_model,
         }
 
         # Prepare and submit requests for all evals concurrently so the planner sees work ASAP
@@ -585,6 +819,14 @@ class EvalManager:
                             "eval_name": eval_name,
                             "eval_job_id": job_id,
                         }
+                        if reasoning_model:
+                            try:
+                                current_max = int(request.get("max_tokens", 0))
+                            except Exception:
+                                current_max = 0
+                            if current_max < self.reasoning_max_tokens:
+                                request["max_tokens"] = self.reasoning_max_tokens
+                            extra["reasoning_mode"] = "1"
                         if key_id:
                             extra["key_id"] = key_id
                         if eval_max_conc is not None:
@@ -1247,6 +1489,7 @@ async def submit_evaluation(
     Optional overrides:
       - evals: list[str] of eval module names to run
       - prepare_args: dict of adapter-specific prepare flags (e.g., {"max_prompts": 50})
+      - is_base_model: bool to force model type (True=base, False=instruct)
     """
     model = request_body.get("model")
     if not model:
@@ -1262,6 +1505,9 @@ async def submit_evaluation(
     prepare_args = request_body.get("prepare_args") or {}
     if prepare_args and not isinstance(prepare_args, dict):
         raise HTTPException(status_code=400, detail="'prepare_args' must be an object")
+    is_base_override = request_body.get("is_base_model")
+    if is_base_override is not None and not isinstance(is_base_override, bool):
+        raise HTTPException(status_code=400, detail="'is_base_model' must be a boolean if provided")
 
     # Submit evaluation job
     principal = getattr(request.state, "auth_principal", None)
@@ -1271,6 +1517,7 @@ async def submit_evaluation(
         evals=evals,
         prepare_args=prepare_args,
         key_id=key_id,
+        is_base_override=is_base_override,
     )
 
     return {
@@ -1280,6 +1527,7 @@ async def submit_evaluation(
         "message": f"Evaluation job {job_id} submitted successfully",
         "requested_evals": evals,
         "prepare_args": prepare_args,
+        "is_base_model": is_base_override,
     }
 
 
