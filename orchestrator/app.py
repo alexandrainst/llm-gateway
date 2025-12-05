@@ -1244,7 +1244,7 @@ async def runtime_proxy(
             "endpoint": endpoint,
             "model": payload.get("model"),
         }
-        raise HTTPException(status_code=500, detail=detail)
+        raise HTTPException(status_code=504, detail=detail)
     except Exception as e:
         # Network/serialization or other unexpected proxy-layer failure
         state["last_runtime_err_ts"] = now()
