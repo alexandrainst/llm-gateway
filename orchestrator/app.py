@@ -15,7 +15,7 @@ import docker
 from docker.types import DeviceRequest
 import structlog
 from prometheus_client import Counter, Histogram, Gauge, generate_latest
-from model_utils import detect_is_base_model
+from model_utils import detect_is_base_model, CHAT_TEMPLATE_FILENAMES
 from eval_manager import EvalManager, router as eval_router
 
 log = structlog.get_logger()
@@ -653,15 +653,55 @@ def start_runtime_container_sync(model_id, extra_args=None):
             "--port", str(RUNTIME_PORT)  # Explicitly set port
         ]
     
+    # Add chat template automatically for vLLM if available and not already specified
+    def _maybe_get_chat_template_arg(host_hf_cache_path: str) -> list[str]:
+        try:
+            base_dir = os.path.join(host_hf_cache_path, "hub", f"models--{model_id.replace('/', '--')}")
+            snapshots_dir = os.path.join(base_dir, "snapshots")
+            candidates: list[str] = []
+            if os.path.isdir(snapshots_dir):
+                main_dir = os.path.join(snapshots_dir, "main")
+                if os.path.isdir(main_dir):
+                    candidates.append(main_dir)
+                hashed = []
+                for name in os.listdir(snapshots_dir):
+                    if name == "main":
+                        continue
+                    p = os.path.join(snapshots_dir, name)
+                    if os.path.isdir(p):
+                        try:
+                            hashed.append((os.path.getmtime(p), p))
+                        except Exception:
+                            hashed.append((0, p))
+                hashed.sort(key=lambda x: x[0], reverse=True)
+                candidates.extend([p for _, p in hashed])
+            for snap in candidates:
+                for fname in CHAT_TEMPLATE_FILENAMES:
+                    path = os.path.join(snap, fname)
+                    if not os.path.isfile(path):
+                        continue
+                    try:
+                        if not open(path, "r", encoding="utf-8").read().strip():
+                            continue
+                    except Exception:
+                        continue
+                    # Map host path to runtime path inside container
+                    try:
+                        rel = os.path.relpath(path, host_hf_cache_path)
+                        in_container = os.path.join("/root/.cache/huggingface", rel)
+                        return ["--chat-template", in_container]
+                    except Exception:
+                        return []
+        except Exception as e:
+            log.warning("chat_template_lookup_failed", model=model_id, error=str(e))
+        return []
+
     # Add extra args or default args
     if extra_args:
         cmd += extra_args.split()
     else:
         cmd += RUNTIME_ARGS.split()
     
-    # Log the command for debugging
-    log.info("runtime_command", runtime_type=RUNTIME_TYPE, cmd=cmd, model_path=model_path)
-
     # device request for GPUs
     dev_req = DeviceRequest(count=-1, capabilities=[["gpu"]])
 
@@ -687,6 +727,21 @@ def start_runtime_container_sync(model_id, extra_args=None):
 
     host_hf_cache_path = _detect_host_hf_cache()
     log.info("using_host_hf_cache", host_path=host_hf_cache_path, container_path="/root/.cache/huggingface")
+
+    if RUNTIME_TYPE == "vllm":
+        try:
+            existing_args = set(cmd)
+            has_chat_arg = "--chat-template" in existing_args
+            if not has_chat_arg:
+                chat_args = _maybe_get_chat_template_arg(host_hf_cache_path)
+                if chat_args:
+                    cmd += chat_args
+                    log.info("using_chat_template_for_runtime", model=model_id, chat_template=chat_args[-1])
+        except Exception as e:
+            log.warning("add_chat_template_arg_failed", model=model_id, error=str(e))
+    
+    # Log the command for debugging
+    log.info("runtime_command", runtime_type=RUNTIME_TYPE, cmd=cmd, model_path=model_path)
 
     volumes = {
         # Map host HF cache into runtime container under its default HF location
@@ -978,7 +1033,7 @@ async def http_health_ok(timeout_s: float = 3.0) -> bool:
 async def runtime_proxy(
     endpoint: str,
     payload: dict,
-    timeout=120,
+    timeout=600,
     source: str = "unknown",
     usage_context: Optional[Dict[str, Any]] = None,
 ):
@@ -1070,7 +1125,26 @@ async def runtime_proxy(
                             if not usage_recorded:
                                 await _record_usage_if_needed(None, status="error")
                                 usage_recorded = True
-                            raise HTTPException(status_code=r.status_code, detail=error_payload)
+                            error_id = f"rt-{uuid.uuid4().hex[:8]}"
+                            log.error(
+                                "runtime_stream_error",
+                                error_id=error_id,
+                                endpoint=endpoint,
+                                status_code=r.status_code,
+                                error=error_payload,
+                                model=payload.get("model"),
+                            )
+                            raise HTTPException(
+                                status_code=r.status_code,
+                                detail={
+                                    "error": "runtime_stream_error",
+                                    "error_id": error_id,
+                                    "upstream_status": r.status_code,
+                                    "upstream_error": error_payload,
+                                    "endpoint": endpoint,
+                                    "model": payload.get("model"),
+                                },
+                            )
                         async for chunk in r.aiter_bytes():
                             if track_usage and chunk:
                                 try:
@@ -1116,7 +1190,25 @@ async def runtime_proxy(
                 if not usage_recorded:
                     await _record_usage_if_needed(None, status="error")
                     usage_recorded = True
-                raise HTTPException(status_code=r.status_code, detail=error_detail)
+                error_id = f"rt-{uuid.uuid4().hex[:8]}"
+                # Log rich context for visibility into runtime failures
+                log.error(
+                    "runtime_nonstream_error",
+                    error_id=error_id,
+                    endpoint=endpoint,
+                    status_code=r.status_code,
+                    error=error_detail,
+                    model=payload.get("model"),
+                )
+                detail: dict[str, Any] = {
+                    "error": "runtime_error",
+                    "error_id": error_id,
+                    "upstream_status": r.status_code,
+                    "upstream_error": error_detail,
+                    "endpoint": endpoint,
+                    "model": payload.get("model"),
+                }
+                raise HTTPException(status_code=r.status_code, detail=detail)
             state["last_runtime_ok_ts"] = now()
             result = r.json()
             if not usage_recorded:
@@ -1126,12 +1218,58 @@ async def runtime_proxy(
             return result
     except HTTPException:
         raise
-    except Exception:
+    except httpx.TimeoutException as e:
+        # Request timed out - likely due to high GPU load
         state["last_runtime_err_ts"] = now()
+        error_id = f"rt-{uuid.uuid4().hex[:8]}"
+        log.error(
+            "runtime_proxy_timeout",
+            error_id=error_id,
+            endpoint=endpoint,
+            timeout_s=timeout,
+            error=str(e),
+            model=payload.get("model"),
+        )
         if not usage_recorded:
             await _record_usage_if_needed(None, status="error")
             usage_recorded = True
-        raise
+        detail: Dict[str, Any] = {
+            "error": "runtime_proxy_timeout",
+            "error_id": error_id,
+            "message": (
+                f"Request to runtime timed out after {timeout}s. "
+                "The model may be overloaded due to high GPU utilization or processing "
+                "a large batch of concurrent requests."
+            ),
+            "endpoint": endpoint,
+            "model": payload.get("model"),
+        }
+        raise HTTPException(status_code=504, detail=detail)
+    except Exception as e:
+        # Network/serialization or other unexpected proxy-layer failure
+        state["last_runtime_err_ts"] = now()
+        error_id = f"rt-{uuid.uuid4().hex[:8]}"
+        log.error(
+            "runtime_proxy_exception",
+            error_id=error_id,
+            endpoint=endpoint,
+            error=str(e) or repr(e),
+            error_type=type(e).__name__,
+            model=payload.get("model"),
+            max_tokens=payload.get("max_tokens"),
+            stream=payload.get("stream"),
+        )
+        if not usage_recorded:
+            await _record_usage_if_needed(None, status="error")
+            usage_recorded = True
+        detail: Dict[str, Any] = {
+            "error": "runtime_proxy_error",
+            "error_id": error_id,
+            "message": str(e) or repr(e),
+            "endpoint": endpoint,
+            "model": payload.get("model"),
+        }
+        raise HTTPException(status_code=500, detail=detail)
     finally:
         if source == "realtime":
             state["inflight_realtime"] = max(0, state.get("inflight_realtime", 0) - 1)
@@ -2118,7 +2256,15 @@ async def completions(
     # Check if request is for realtime model
     if req.model != REALTIME_MODEL:
         # If not realtime model, could enqueue as batch or reject
-        raise HTTPException(status_code=400, detail=f"Model {req.model} not available for realtime. Use /v1/jobs for batch processing.")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "model_not_available",
+                "message": f"Model '{req.model}' not available for realtime on this endpoint.",
+                "requested_model": req.model,
+                "available_realtime_model": REALTIME_MODEL,
+            },
+        )
     
     # Check if realtime model is hot
     if state.get("current_model") == REALTIME_MODEL and is_runtime_ready():
@@ -2144,6 +2290,9 @@ async def completions(
                 source="realtime",
                 usage_context=usage_context,
             )
+        except HTTPException as e:
+            # Preserve upstream HTTPException details (including structured runtime error info)
+            raise e
         except httpx.ConnectError as e:
             # Runtime is actually down
             log.error("completions_proxy_connect_error", error=str(e))
@@ -2151,8 +2300,24 @@ async def completions(
             # Fall through to cold start
         except Exception as e:
             # Request-level error, runtime is still up
-            log.error("completions_proxy_error", error=str(e))
-            raise HTTPException(status_code=500, detail=str(e))
+            error_id = f"rt-{uuid.uuid4().hex[:8]}"
+            log.error(
+                "completions_proxy_error",
+                error_id=error_id,
+                error=str(e) or repr(e),
+                error_type=type(e).__name__,
+                model=req.model,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "gateway_proxy_error",
+                    "error_id": error_id,
+                    "message": str(e) or repr(e),
+                    "endpoint": "/v1/completions",
+                    "model": req.model,
+                },
+            )
     
     # Model needs to be loaded - return 503 with dynamic Retry-After
     # Initialize cooldown start if not set yet
@@ -2207,7 +2372,15 @@ async def chat_completions(
         pass
     # Check if request is for realtime model
     if req.model != REALTIME_MODEL:
-        raise HTTPException(status_code=400, detail=f"Model {req.model} not available for realtime. Use /v1/jobs for batch processing.")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "model_not_available",
+                "message": f"Model '{req.model}' not available for realtime on this endpoint.",
+                "requested_model": req.model,
+                "available_realtime_model": REALTIME_MODEL,
+            },
+        )
     
     # Check if realtime model is hot
     if state.get("current_model") == REALTIME_MODEL and is_runtime_ready():
@@ -2219,6 +2392,9 @@ async def chat_completions(
                 source="realtime",
                 usage_context=usage_context,
             )
+        except HTTPException as e:
+            # Preserve upstream HTTPException details (including structured runtime error info)
+            raise e
         except httpx.ConnectError as e:
             # Runtime is actually down
             log.error("chat_completions_proxy_connect_error", error=str(e))
@@ -2226,9 +2402,29 @@ async def chat_completions(
             # Fall through to cold start
         except Exception as e:
             # Request-level error, runtime is still up
-            log.error("chat_completions_proxy_error", error=str(e))
-            raise HTTPException(status_code=500, detail=str(e))
-    
+            err_detail = getattr(e, "detail", None)
+            error_id = f"rt-{uuid.uuid4().hex[:8]}"
+            log.error(
+                "chat_completions_proxy_error",
+                error_id=error_id,
+                error=str(e) or repr(e),
+                error_type=type(e).__name__,
+                detail=err_detail,
+                model=req.model,
+                max_tokens=payload.get("max_tokens"),
+                messages_count=len(payload.get("messages", [])),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "gateway_proxy_error",
+                    "error_id": error_id,
+                    "message": str(e) or "runtime_proxy_error",
+                    "endpoint": "/v1/chat/completions",
+                    "model": req.model,
+                },
+            )
+
     # Model needs to be loaded - return 503 with dynamic Retry-After
     if not state.get("rt_cooldown_start_ts"):
         state["rt_cooldown_start_ts"] = now()
@@ -2502,6 +2698,15 @@ async def batch_planner_loop():
             except Exception:
                 pass
             if not queued:
+                eval_mgr = getattr(app.state, "eval_manager", None)
+                pending_submitters = getattr(eval_mgr, "submission_in_progress", 0) if eval_mgr else 0
+                if pending_submitters:
+                    log.debug(
+                        "batch_queue_empty_waiting_for_submission",
+                        pending_submitters=pending_submitters,
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
                 # If there are no batch jobs and we're not on the realtime model, switch back proactively
                 if state.get("current_model") != REALTIME_MODEL:
                     loading_task = state.get("loading_task")
@@ -2878,6 +3083,7 @@ async def batch_planner_loop():
                         "scope": "batch",
                         "metadata": metadata,
                     }
+                reasoning_flag = jobh.get("reasoning_mode") in ("1", "true", "True")
 
                 def _decode_json_field(val: Optional[str]):
                     if val is None or val == "" or val == "null":
@@ -3098,6 +3304,12 @@ async def batch_planner_loop():
                                 f.write(f"Finish reason: {res['choices'][0].get('finish_reason', 'unknown')}\n")
                             else:
                                 f.write(f"No choices in response: {json.dumps(res)[:500]}\n")
+                    if reasoning_flag and isinstance(res, dict):
+                        choices = res.get("choices")
+                        if isinstance(choices, list):
+                            for choice in choices:
+                                if isinstance(choice, dict) and "logprobs" in choice:
+                                    choice["logprobs"] = None
                     
                     await redis.hset(JOB_HASH_PREFIX + jid, mapping={"status": "completed", "result": json.dumps(res), "finished_ts": str(now())})
                     completed_count += 1
@@ -3634,6 +3846,7 @@ app.include_router(v1_router)
 app.include_router(upload_router)
 app.include_router(eval_router, dependencies=[Depends(make_require_scopes({"eval"}))])  # /eval endpoints
 app.include_router(ui_router)
+
 async def drop_queued_jobs_for_model(model_id: str, reason: str = "model_failure"):
     """Remove queued jobs for a model and mark them as error for visibility."""
     try:

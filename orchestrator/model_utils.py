@@ -29,10 +29,12 @@ def _ensure_tokenizer_files(model_id: str) -> None:
     # Always use the container-side mount path for the HF cache
     cache_root = "/host_hf_cache"
     token = os.getenv("HF_TOKEN")
-    # Only fetch tokenizer_config.json; detection relies solely on its chat_template
+    # Only fetch tokenizer_config.json and chat_template files; detection relies on them
     allow = [
         "tokenizer_config.json",
         "*/tokenizer_config.json",
+        "chat_template.jinja",
+        "*/chat_template.jinja",
     ]
     try:
         snapshot_download(

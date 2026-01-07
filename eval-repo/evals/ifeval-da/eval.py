@@ -27,6 +27,24 @@ except LookupError:
 
 from ifeval_da import evaluation_lib_key_based as evaluation_lib
 
+REASONING_END_TOKENS = ("</think>", "</reason>", "</reasoning>", "</analysis>", "</chain_of_thought>")
+REASONING_START_TOKENS = ("<think>", "<reason>", "<reasoning>", "<analysis>", "<chain_of_thought>")
+
+
+def _strip_reasoning_content(text: str | None) -> str:
+    """Drop reasoning traces (<think>...</think>) so scoring sees the final answer."""
+    if not text:
+        return ""
+    lowered = text.lower()
+    for marker in REASONING_END_TOKENS:
+        idx = lowered.rfind(marker)
+        if idx != -1:
+            return text[idx + len(marker):].lstrip()
+    for marker in REASONING_START_TOKENS:
+        if marker in lowered:
+            return ""
+    return text
+
 
 def prepare_requests(model_name: str, **kwargs) -> Dict:
     """
@@ -133,6 +151,7 @@ def score_results(requests: List[Dict], responses: List[Dict], metadata: Dict) -
             if response_text is None:
                 none_responses.append(key)
             else:
+                response_text = _strip_reasoning_content(response_text)
                 response_dict[key] = [response_text]  # Wrap in list as expected
     
     # Run both strict and loose evaluation
