@@ -1033,7 +1033,7 @@ async def http_health_ok(timeout_s: float = 3.0) -> bool:
 async def runtime_proxy(
     endpoint: str,
     payload: dict,
-    timeout=120,
+    timeout=600,
     source: str = "unknown",
     usage_context: Optional[Dict[str, Any]] = None,
 ):
